@@ -244,6 +244,49 @@ aid, sh, login = B.lsb_member_session(44)
 check(aid == 1044 and login == "pol44", "auth failure -> create -> auth succeeds, no admin step")
 
 # ---------------------------------------------------------------------------
+# Per-client advertise map. The packet is SYNTHETIC: same 72-byte layout as a
+# real 0x0B handoff (header, LSB's md5 at 12..28, ids, a 16-byte name, the zone
+# ip/port at 56..64 and the search ip/port at 64..72), built here with made-up
+# values. Never paste a captured packet into a test: it carries a real account
+# name and real addresses as bytes, where no text scan can see them.
+import hashlib as _hl, socket as _so
+
+
+def _handoff(zone_ip, search_ip, name=b"Examplemember"):
+    pkt = bytearray(bytes.fromhex("48000000495846460b000000") + b"\0" * 16
+                    + bytes.fromhex("0500000005000000")
+                    + name.ljust(16, b"\0") + bytes.fromhex("20000000")
+                    + _so.inet_aton(zone_ip) + bytes.fromhex("d6d30000")
+                    + _so.inet_aton(search_ip) + bytes.fromhex("f2d20000"))
+    pkt[12:28] = _hl.md5(bytes(pkt)).digest()      # signed over a zeroed field
+    return bytes(pkt)
+
+
+OVERLAY = "198.51.100.60"          # TEST-NET-2: stands in for an overlay address
+LAN_IP = "192.168.0.10"  # generic example address; polcheck: allow
+HANDOFF = _handoff(OVERLAY, OVERLAY)
+check(len(HANDOFF) == 72 and _so.inet_ntoa(HANDOFF[56:60]) == OVERLAY,
+      "fixture has the handoff layout: zone ip at offset 56")
+_saved_map, _saved_fix = B.ADVERTISE_MAP, B.WORLD_ID_FIX
+B.WORLD_ID_FIX = False
+B.ADVERTISE_MAP = B._parse_advertise_map("192.168.0.0/16=" + LAN_IP)  # generic example address; polcheck: allow
+lan = B.rewrite_s2c(HANDOFF, "T", None, "192.168.0.50:61709")  # generic example address; polcheck: allow
+check(_so.inet_ntoa(lan[56:60]) == LAN_IP and _so.inet_ntoa(lan[64:68]) == LAN_IP,
+      "a LAN client is handed the LAN address for zone AND search")
+check(lan[60:64] == HANDOFF[60:64] and lan[68:72] == HANDOFF[68:72] and lan[28:56] == HANDOFF[28:56],
+      "...and nothing else in the handoff moves (ports, charid, name, server id)")
+_z = bytearray(lan); _z[12:28] = b"\0" * 16
+check(_hl.md5(bytes(_z)).digest() == lan[12:28], "...and the packet is re-signed (LSB's md5)")
+ts = B.rewrite_s2c(HANDOFF, "T", None, "198.51.100.37:50944")
+check(ts == HANDOFF, "a client outside every CIDR gets LSB's packet byte for byte")
+B.ADVERTISE_MAP = []
+check(B.rewrite_s2c(HANDOFF, "T", None, "192.168.0.50:61709") == HANDOFF,  # generic example address; polcheck: allow
+      "with no map configured the handoff is untouched (old behaviour)")
+check(B._parse_advertise_map("garbage,10.0.0.0/8=10.0.0.5")[0][2] == "10.0.0.5",  # generic example address; polcheck: allow
+      "a malformed map entry is skipped, the good one kept")
+B.ADVERTISE_MAP, B.WORLD_ID_FIX = _saved_map, _saved_fix
+
+# ---------------------------------------------------------------------------
 shutil.rmtree(TMP, ignore_errors=True)
 if FAILS:
     print(f"\nFAIL: {len(FAILS)} check(s):")

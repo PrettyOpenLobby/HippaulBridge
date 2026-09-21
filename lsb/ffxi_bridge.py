@@ -113,6 +113,53 @@ BRIDGE_DATA    = int(os.environ.get("BRIDGE_DATA_PORT", "54230"))
 LSB_ACCOUNT    = os.environ.get("LSB_ACCOUNT", "poltest")
 LSB_PASSWORD   = os.environ.get("LSB_PASSWORD", "poltest123")
 SEARCH_IP      = os.environ.get("SEARCH_IP", "127.0.0.1")  # search/cache server given to client
+
+#: PER-CLIENT world/search address. LSB stamps ONE address into the 0x0B handoff
+#: (its zone table, seeded from LSB_ADVERTISE_IP) and that address is only right
+#: for clients that can route to it. Seen with a server advertising an overlay
+#: network address: a PS2 on the LAN received that address in 0x0B, opened UDP
+#: to it on 54230 and nothing ever arrived. LSB cleared the pending session 65 s
+#: later and the client sat on a black screen. The lobby itself was
+#: fine, because the client reaches THAT by DNS name.
+#:
+#:   BRIDGE_ADVERTISE_MAP="192.168.0.0/16=127.0.0.1,10.0.0.0/8=10.0.0.5"  # generic RFC1918 example; polcheck: allow
+#:
+#: First CIDR containing the client's address wins; no match (or unset) leaves
+#: LSB's address alone, which is the old behaviour.
+def _parse_advertise_map(text):
+    import ipaddress
+    out = []
+    for part in (text or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            cidr, ip = part.split("=", 1)
+            out.append((ipaddress.ip_network(cidr.strip(), strict=False),
+                        socket.inet_aton(ip.strip()), ip.strip()))
+        except (ValueError, OSError) as exc:
+            print(f"[boot] BRIDGE_ADVERTISE_MAP entry {part!r} ignored: {exc!r}",
+                  flush=True)
+    return out
+
+
+ADVERTISE_MAP = _parse_advertise_map(os.environ.get("BRIDGE_ADVERTISE_MAP", ""))
+
+
+def advertise_ip_for(client_ip):
+    """(packed, text) address to hand THIS client, or (None, None) for LSB's own."""
+    import ipaddress
+    try:
+        addr = ipaddress.ip_address((client_ip or "").strip("[]"))
+    except ValueError:
+        return None, None
+    if getattr(addr, "ipv4_mapped", None):
+        addr = addr.ipv4_mapped
+    for net, packed, text in ADVERTISE_MAP:
+        if addr.version == net.version and addr in net:
+            return packed, text
+    return None, None
+
 XILOADER_VER   = [2, 1, 0]
 
 # --- ROUTE BY REPORTED CLIENT VERSION ---------------------------------------
@@ -218,6 +265,10 @@ _world_id = int(os.environ.get("FFXI_WORLD_ID", "0x20"), 0)
 #: `lpkt_next_login`: ffxi_id(28) ffxi_id_world(32) character_name[16](36)
 #: server_id(52) server_ip(56) server_port(60) cache_ip(64) cache_port(68) = 72B.
 NEXT_LOGIN_SERVER_ID = HDR_LEN + 24
+#: 0x0B handoff address fields, read off a live packet (PS2 client, 2026-09-20):
+#: zone ip @56 / port u32 @60, search ip @64 / port u32 @68, IPs in network order.
+HANDOFF_ZONE_IP   = HDR_LEN + 28
+HANDOFF_SEARCH_IP = HDR_LEN + 36
 #: `lpkt_chr_info_sub2`: ffxi_id(+0) ffxi_id_world(+4,u16) worldid(+6,u16) ...
 CHR_REC_WORLDID = 6
 
@@ -1647,6 +1698,18 @@ def rewrite_s2c(pkt, label, member_id=None, ckey=None):
                 changed = True
                 log(label, f"  0x0B handoff: server_id {was} -> 0x{_world_id:02X} "
                            f"(matching the world list)")
+        if ADVERTISE_MAP and ckey and len(pkt) >= HANDOFF_SEARCH_IP + 4:
+            packed, text = advertise_ip_for(str(ckey).rsplit(":", 1)[0])
+            if packed is not None:
+                for off, what in ((HANDOFF_ZONE_IP, "zone"),
+                                  (HANDOFF_SEARCH_IP, "search")):
+                    was = bytes(pkt[off:off + 4])
+                    if was != packed and was != b"\0\0\0\0":
+                        out[off:off + 4] = packed
+                        changed = True
+                        log(label, f"  0x0B handoff: {what} ip "
+                                   f"{socket.inet_ntoa(was)} -> {text} "
+                                   f"(BRIDGE_ADVERTISE_MAP, client {ckey})")
         # The ffxi_id REWRITE is off by default -- see MAP_HANDOFF. Rewriting that
         # field breaks the world login.
         cid = content_id_for(charid) if MAP_HANDOFF else None
