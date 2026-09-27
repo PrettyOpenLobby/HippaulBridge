@@ -27,11 +27,13 @@ The five things below are the ones that can silently come back:
   3. moving a title between handles carries EVERY slot. This one is a real trap:
      the old `link_content_to_handle` did DELETE-then-INSERT, which was lossless
      when a game had one id and destroys all but one now;
-  4. the wire record's binding overflow -- a handle can hold more Content IDs
-     than the client can SHOW, and the ones that overflow must be the extra FFXI
-     slots, never another title;
+  4. the wire never carries more than eight Content IDs for one handle, all
+     bound, and what falls off the end is an extra FFXI slot, never another
+     title; the mint itself stops at that ceiling;
   5. the bridge sees the whole pool, because that is what it offers the client
-     as empty character slots.
+     as empty character slots;
+  6. `accounts.py trim-ffxi-slots` cleans up a database written before the
+     ceiling, and never deactivates an id a character is named after.
 
 Run from tools/: `python ffxi_char_slots_test.py`. Exits non-zero on failure.
 Needs the OpenLobby core's `services/` (accounts.py, responders.py): set
@@ -49,7 +51,7 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from openlobby_paths import require_services                      # noqa: E402
-require_services("ffxi_char_slots_test")
+SERVICES = require_services("ffxi_char_slots_test")
 
 TMP = tempfile.mkdtemp(prefix="ffxi-char-slots-")
 os.environ["POL_ACCOUNTS_DB"] = os.path.join(TMP, "accounts.db")
@@ -229,34 +231,101 @@ check(not dupes3, "the move did not duplicate an id (%s)"
 
 # --------------------------------------------------------------------------- #
 print()
-print("4. THE WIRE RECORD -- eight bound, the rest present but unbound")
+print("4. THE WIRE NEVER CARRIES A NINTH CONTENT ID FOR ONE HANDLE")
 
-# The handle binding is an 8-byte array at handle_slot+0x20 and the record's
-# position field is 3 bits, so only eight of a handle's Content IDs can be BOUND.
-# That is not a limit on the 64-slot table the launch gate and FFXI's world
-# lookup actually read, so the overflow is served UNBOUND: playable, just absent
-# from the profile view's Content ID list.
+# THE REGRESSION THIS SECTION EXISTS FOR.
+# `_db_chars` used to serve a handle's ninth and later Content IDs UNBOUND
+# (`+0x04 = 0`), on the reasoning that the launch gate (app.dll+0x199093) and
+# FFXI's world lookup (FUN_100FFE00) read the 64-slot table and ignore the
+# binding. They do. They are also not the consumer that decides: the VIEWER
+# reads a present-but-unbound Content ID as one that still needs a handle and
+# opens the assign-a-handle flow, which dead-ends on the very ceiling that left
+# it unbound -- string 26069, "The handle "%s" is already linked to 8 Content
+# IDs." FFXI is then unreachable from that handle. It came back once after a
+# data-only revert, which is why the check below is on the code path.
+#
+# So the check is not "are the extras encoded correctly" any more. It is: given
+# a handle holding MORE than the ceiling, does the wire carry eight?
 REC = 104
+over = fresh_db("overflow.db")
+os.environ["POL_ACCOUNTS_DB"] = os.path.join(TMP, "overflow.db")
+A.create_polid(over, "OVERFLW", "pw-account")
+omid = A.add_member(over, "OVERFLW", "overflow", "pw-member")
+A.set_handle(over, omid, "Tester")
+ohid = A.primary_handle_row(over, omid)["id"]
+for code in (1, 2, 3, 4, 10, 11, 14, 15):        # every title we serve
+    A.grant_content(over, omid, code)
+A.link_member_content_to_primary(over, omid)
+# ...plus the three extra FFXI ids a pre-fix account was minted at sign-up. Put
+# them in by hand: `ensure_content_slots` now clamps, which is check 4c below,
+# and the input to 4a has to be an over-ceiling handle or it proves nothing.
+for slot in (1, 2, 3):
+    over.execute("INSERT INTO handle_content (handle_id, content_code, slot,"
+                 " content_id, status, linked_at) VALUES (?,1,?,?,'active',?)",
+                 (ohid, slot, "3000099%d" % slot, "2026-09-22T00:00:00Z"))
+over.commit()
+held = len(A.handle_content_list(over, ohid))
+check(held > R._CHAR_PER_HANDLE,
+      "the handle under test really is over the ceiling (%d links)" % held)
+
+served = R._db_chars()
+check(len(served) == R._CHAR_PER_HANDLE,
+      "4a. the wire carries exactly %d records, not %d (%d)"
+      % (R._CHAR_PER_HANDLE, held, len(served)))
+check(all(rec[4] for rec in served),
+      "4b. EVERY served record is BOUND (unbound: %s)"
+      % ([r[2:4] for r in served if not r[4]],))
+codes = [rec[2] for rec in served]
+check(set(codes) >= set([1, 2, 3, 4, 10, 11, 14, 15]),
+      "...and no TITLE was dropped to make room (%s)" % (sorted(set(codes)),))
+check(sorted(rec[1] for rec in served) == list(range(R._CHAR_PER_HANDLE)),
+      "...positions are 0..%d with no gap (%s)"
+      % (R._CHAR_PER_HANDLE - 1, [r[1] for r in served]))
+
+# 4c. THE MINT ITSELF STOPS AT THE CEILING, so 4a should never have to bite.
+# A fully granted handle asking for four FFXI ids gets none: eight links is
+# every title, and a ninth is the dialog above.
+full = fresh_db("ceiling.db")
+A.create_polid(full, "CEILING", "pw-account")
+fmid = A.add_member(full, "CEILING", "ceiling", "pw-member")
+A.set_handle(full, fmid, "Full")
+fhid = A.primary_handle_row(full, fmid)["id"]
+for code in (1, 2, 3, 4, 10, 11, 14, 15):
+    A.grant_content(full, fmid, code)
+A.link_member_content_to_primary(full, fmid)
+minted = A.ensure_content_slots(full, fhid, A.FFXI_CONTENT_CODE, 4)
+check(minted == 0, "4c. a fully granted handle mints no extra slot (%d)" % minted)
+check(A.handle_link_count(full, fhid) <= A.CONTENT_IDS_PER_HANDLE,
+      "...and holds at most %d Content IDs (%d)"
+      % (A.CONTENT_IDS_PER_HANDLE, A.handle_link_count(full, fhid)))
+# A handle with ROOM still gets what fits -- the clamp is a ceiling, not a ban.
+room = fresh_db("room.db")
+A.create_polid(room, "ROOM", "pw-account")
+rmid = A.add_member(room, "ROOM", "room", "pw-member")
+A.set_handle(room, rmid, "Roomy")
+rhid = A.primary_handle_row(room, rmid)["id"]
+A.grant_content(room, rmid, A.FFXI_CONTENT_CODE)
+A.link_member_content_to_primary(room, rmid)
+got = A.ensure_content_slots(room, rhid, A.FFXI_CONTENT_CODE, 4)
+check(got == 3 and A.handle_link_count(room, rhid) == 4,
+      "4d. a handle holding only FFXI can still be raised to four (%d minted)" % got)
+
+# The record encoder still has to be able to say both things -- `bind` is what
+# 4b reads -- even though `_db_chars` now only ever passes True.
 bound = R._char_record(REC, 0, 0, 0, A.FFXI_CONTENT_CODE, "30000037", bind=True)
 unbound = R._char_record(REC, 9, 0, 9, A.FFXI_CONTENT_CODE, "30000099", bind=False)
 check(bound[0x04] == 1, "a bound record sets the bind flag (+0x04 = %d)" % bound[0x04])
 check(unbound[0x04] == 0, "an unbound record clears it (+0x04 = %d)" % unbound[0x04])
-check(unbound[0x06] == 0,
-      "...and does not claim a binding position (+0x06 = %d)" % unbound[0x06])
-# The half that MUST survive being unbound: the launch gate walks the table for
-# the present bit and the CONTENT CODE, and FFXI's lookup for the Content ID.
-check(struct.unpack_from("<H", unbound, 0x08)[0] == A.FFXI_CONTENT_CODE,
-      "an unbound record still carries its content code (the launch gate's field)")
-check(struct.unpack_from("<I", unbound, 0x10)[0] == 30000099,
-      "...and still carries the Content ID FFXI's world lookup compares")
-check(unbound[0x00] == 9, "...and still claims its own character-table index")
+check(struct.unpack_from("<H", bound, 0x08)[0] == A.FFXI_CONTENT_CODE,
+      "a served record carries its content code (the launch gate's field)")
+check(struct.unpack_from("<I", bound, 0x10)[0] == 30000037,
+      "...and the Content ID FFXI's world lookup compares")
 
-# The ORDERING rule: positions go to every game's slot 0 first. Ordering by
-# (content_code, slot) alone would give FFXI's four slots positions 0-3 and push
-# three other TITLES out of the profile view -- a visible regression traded for a
-# cosmetic one.
+# The ORDERING rule, unchanged and now load-bearing: positions go to every
+# game's slot 0 first, so what falls off the end is an extra FFXI character slot
+# and never a whole TITLE.
 links = ([{"content_code": 1, "slot": i, "content_id": "3000010%d" % i}
-          for i in range(N)]
+          for i in range(4)]
          + [{"content_code": c, "slot": 0, "content_id": "300002%02d" % c}
             for c in (2, 3, 4, 10, 11, 14, 15)])
 primary = [l for l in links if int(l.get("slot", 0)) == 0]
@@ -266,9 +335,11 @@ bound_codes = set(c for c, _s in order[:R._CHAR_PER_HANDLE])
 check(bound_codes == set([1, 2, 3, 4, 10, 11, 14, 15]),
       "every TITLE keeps a binding position (%s)" % (sorted(bound_codes),))
 check(all(c == 1 and s > 0 for c, s in order[R._CHAR_PER_HANDLE:]),
-      "only extra FFXI slots overflow (%s)" % (order[R._CHAR_PER_HANDLE:],))
+      "only extra FFXI slots fall off the end (%s)" % (order[R._CHAR_PER_HANDLE:],))
 
-# --------------------------------------------------------------------------- #
+os.environ["POL_ACCOUNTS_DB"] = os.path.join(TMP, "accounts.db")
+
+
 print()
 print("5. THE BRIDGE SEES THE WHOLE POOL")
 
@@ -291,6 +362,100 @@ B._idmap = dict((str(i + 1), pool[i]) for i in range(N - 1))
 free = [c for c in B.pol_content_ids(mid) if c not in set(B._idmap.values())]
 check(len(free) == 1,
       "%d characters in, one Content ID still free (%s)" % (N - 1, free))
+
+# --------------------------------------------------------------------------- #
+print()
+print("6. THE OPERATOR COMMAND THAT CLEANS UP EXISTING ACCOUNTS")
+
+# `trim-ffxi-slots` is what an operator runs on a database that was written
+# BEFORE the ceiling was enforced -- the rows are still there, and the bridge
+# still offers them as empty character slots even though the wire drops them.
+# The whole risk of the command is in one place: deactivating an id a character
+# is already named after makes that character POL-0001 at select for ever. So
+# the checks below are mostly about what it REFUSES to do.
+import io                                                          # noqa: E402
+import json                                                        # noqa: E402
+import subprocess                                                  # noqa: E402
+
+CLI_DB = os.path.join(TMP, "trim.db")
+IDMAP = os.path.join(TMP, "trim_idmap.json")
+
+cli = fresh_db("trim.db")
+acct = A.register_account(cli, "Examplemember05", "password123",
+                          contents=(1, 2, 3, 4, 10, 11, 14))
+chid = cli.execute("SELECT id FROM handle WHERE member_id = ?",
+                   (acct["member_id"],)).fetchone()["id"]
+for slot in (1, 2, 3):                       # what a pre-fix sign-up was minted
+    cli.execute("INSERT INTO handle_content (handle_id, content_code, slot,"
+                " content_id, status, linked_at) VALUES (?,1,?,?,'active',?)",
+                (chid, slot, "3000099%d" % slot, "2026-09-22T00:00:00Z"))
+cli.commit()
+extras = [r["content_id"] for r in A.handle_content_list(cli, chid)
+          if int(r["content_code"]) == 1 and int(r["slot"]) != 0]
+json.dump({"7": {"content_id": int(extras[0]), "name": "Ayla", "world_field": 1}},
+          io.open(IDMAP, "w", encoding="utf-8"))
+
+
+def trim(*argv):
+    r = subprocess.run([sys.executable, "accounts.py", CLI_DB] + list(argv),
+                       cwd=SERVICES, capture_output=True, text=True)
+    return r.returncode, r.stdout + r.stderr
+
+
+def active_extras():
+    db = A.connect(CLI_DB)
+    try:
+        return int(db.execute(
+            "SELECT COUNT(*) n FROM handle_content WHERE content_code = 1"
+            " AND slot <> 0 AND status = 'active'").fetchone()["n"])
+    finally:
+        db.close()
+
+
+rc, out = trim("trim-ffxi-slots", "--idmap", IDMAP)
+check(rc == 0 and active_extras() == 3,
+      "6a. the default is a REPORT and writes nothing (rc %d, %d active)"
+      % (rc, active_extras()))
+check("Ayla IS ON THIS ID" in out,
+      "...and it names the character sitting on an id")
+
+# 6b. THE ONE THAT MATTERS. No id map = no way to know what is in use, so the
+# command must not guess. An empty map must never read as "nothing is in use".
+rc, out = trim("trim-ffxi-slots", "--apply", "--idmap", os.path.join(TMP, "gone.json"))
+check(rc != 0 and "REFUSING" in out and active_extras() == 3,
+      "6b. --apply REFUSES when the id map cannot be read (rc %d, %d active)"
+      % (rc, active_extras()))
+check(all(ord(ch) < 127 for ch in out),
+      "...and says so in ASCII, which a cp1252 console can actually print")
+
+rc, out = trim("trim-ffxi-slots", "--apply", "--idmap", IDMAP)
+check(rc == 0 and active_extras() == 1,
+      "6c. --apply trims the free ids and KEEPS the one with a character on it"
+      " (%d left)" % active_extras())
+kept = A.connect(CLI_DB)
+check([r["content_id"] for r in A.handle_content_list(kept, chid)
+       if int(r["content_code"]) == 1 and int(r["slot"]) != 0] == [extras[0]],
+      "...and the one it kept is Ayla's")
+kept.close()
+
+os.environ["POL_ACCOUNTS_DB"] = CLI_DB
+after = R._db_chars()
+check(len(after) <= R._CHAR_PER_HANDLE and all(rec[4] for rec in after),
+      "...so the wire is back under the ceiling, all bound (%d records)"
+      % len(after))
+os.environ["POL_ACCOUNTS_DB"] = os.path.join(TMP, "accounts.db")
+
+rc, out = trim("trim-ffxi-slots", "--restore")
+check(rc == 0 and active_extras() == 3,
+      "6d. --restore puts back exactly what it deactivated (%d active)"
+      % active_extras())
+
+# The bridge has written two map shapes over its life and the in-use check has
+# to understand both, or it reports a live character's id as free.
+json.dump({"7": int(extras[0])}, io.open(IDMAP, "w", encoding="utf-8"))
+rc, out = trim("trim-ffxi-slots", "--idmap", IDMAP)
+check(rc == 0 and "IS ON THIS ID" in out,
+      "6e. the flat legacy id map shape is still understood")
 
 # --------------------------------------------------------------------------- #
 print()

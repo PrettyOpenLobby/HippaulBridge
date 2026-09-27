@@ -109,8 +109,12 @@ A PlayOnline account plays FFXI when its handle holds FFXI Content IDs
   granted.
 
 Each grant mints `POL_FFXI_CHARACTER_SLOTS` Content IDs (OpenLobby's setting,
-default 4), one per character slot, because FFXI issues one Content ID per
-character. FFXI must also be listed in OpenLobby's `POL_LOBBY_CONTENT_IDS` for
+default 1), one per character slot, because FFXI issues one Content ID per
+character. A handle can hold at most eight Content IDs across all titles, and
+OpenLobby never mints or serves a ninth: the Viewer refuses to open FFXI on a
+handle it thinks is over that limit. On a handle granted every title, one FFXI
+character is all there is room for; raise `POL_FFXI_CHARACTER_SLOTS` only for
+handles holding fewer titles. FFXI must also be listed in OpenLobby's `POL_LOBBY_CONTENT_IDS` for
 the Play button to appear; the default list includes it.
 
 The first launch does the rest: the bridge creates the member's LSB account
@@ -194,7 +198,8 @@ CONF channel is the PlayOnline lobby, not LSB's.
   `/data/ffxi_idmap.json`; `tools/ffxi_idmap_check.py`; OpenLobby's lobby
   log says `FFXI id map ... DOES NOT EXIST`), or the member has no free
   Content ID for the character (the bridge log says `NO FREE FFXI Content
-  ID`). Raise `POL_FFXI_CHARACTER_SLOTS` in OpenLobby or delete a character.
+  ID`). Delete a character, or raise `POL_FFXI_CHARACTER_SLOTS` in OpenLobby
+  if the handle has room under the eight-Content-ID limit.
 - **FFXI-3100.** Nothing answered on 54001: the bridge is down, or DNS sent
   the client elsewhere. `docker compose logs bridge`.
 - **FFXI-3332 after "Acquiring Player Data".** LSB had no data session for
