@@ -226,6 +226,9 @@ services:
       # receive and rejects silently, so without this "the client never sent it"
       # and "the map dropped it" are indistinguishable. Nothing is rewritten.
       BRIDGE_MAP_PORT: "54230"
+      # Per-client world/search address for the 0x0B handoff, "cidr=ip,...".
+      # Empty = hand every client LSB's own (LSB_ADVERTISE_IP).
+      BRIDGE_ADVERTISE_MAP: "${BRIDGE_ADVERTISE_MAP:-}"
       MAP_HOST: map
       MAP_PORT: "54230"
       # A SECOND WORLD for the FFXI Test Server client (content 0015), routed by
