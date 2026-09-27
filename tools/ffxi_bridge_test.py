@@ -180,6 +180,42 @@ first = B.resolve_pol_member("192.0.2.9")[0]
 second = B.resolve_pol_member("192.0.2.9")[0]
 check({first, second} == {1, 2}, f"two launches from one NAT reach two members ({first}, {second})")
 
+print("   ...and a launch is NEVER handed a session from another address")
+# A player on their own IP was once shown another player's characters. The
+# address was only the last tie-breaker, so any miss of the exact match fell
+# through to the most recently active OTHER member.
+B._claimed_sids.clear()
+# (a) the player's own session is not flagged signed in; someone else's is.
+sessions(uAAAA={"member_id": 1, "peer_ip": "203.0.113.5", "at": now - 60, "chars_at": now - 50, "viewer_open": False},
+         uBBBB={"member_id": 2, "peer_ip": "198.51.100.7", "at": now - 5, "chars_at": now - 4, "viewer_open": True})
+m, how = B.resolve_pol_member("203.0.113.5")
+check(m != 2, f"own session not signed in -> NOT the other player's member 2 ({m}: {how})")
+# (b) the player's address matches no session at all.
+B._claimed_sids.clear()
+sessions(uBBBB={"member_id": 2, "peer_ip": "198.51.100.7", "at": now - 5, "chars_at": now - 4, "viewer_open": True})
+m, how = B.resolve_pol_member("203.0.113.9")
+check(m is None, f"no session from this address -> refused, not member 2 ({m}: {how})")
+# (c) an IPv4-mapped IPv6 peer is the same client, not a stranger.
+B._claimed_sids.clear()
+sessions(uAAAA={"member_id": 1, "peer_ip": "203.0.113.5", "at": now - 60, "chars_at": now - 50, "viewer_open": True},
+         uBBBB={"member_id": 2, "peer_ip": "198.51.100.7", "at": now - 5, "chars_at": now - 4, "viewer_open": True})
+m, how = B.resolve_pol_member("::ffff:203.0.113.5")
+check(m == 1, f"::ffff:203.0.113.5 is the player at 203.0.113.5 ({m}: {how})")
+# (d) The field case: member 26 held several stale signed-in sessions at its
+# own address, all already claimed by earlier launches; the same-address rule
+# saw >1 with none unclaimed and gave up, and the global ranking sorts claimed
+# LAST, so member 30's unclaimed session at another address won.
+B._claimed_sids.clear()
+sessions(u26a={"member_id": 26, "peer_ip": "203.0.113.26", "at": now - 900, "chars_at": now - 950, "viewer_open": True},
+         u26b={"member_id": 26, "peer_ip": "203.0.113.26", "at": now - 600, "chars_at": now - 650, "viewer_open": True},
+         u30={"member_id": 30, "peer_ip": "198.51.100.30", "at": now - 20000, "chars_at": now - 21000, "viewer_open": True})
+B._claimed_sids.update({"u26a": now - 800, "u26b": now - 500})
+m, how = B.resolve_pol_member("203.0.113.26")
+check(m == 26, f"own sessions all claimed -> still member 26, not 30 ({m}: {how})")
+# (e) a stranger (scanner) at an address with no POL session gets nobody.
+m, how = B.resolve_pol_member("192.0.2.21")
+check(m is None, f"an address with no POL session is refused ({m}: {how})")
+
 # ---------------------------------------------------------------------------
 print("4. A REFUSED DELETE RE-PAIRS THE CHARACTER TO THE ID IT HAD")
 reset([30000400, 30000401, 30000402])

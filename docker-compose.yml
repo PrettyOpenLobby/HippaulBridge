@@ -215,6 +215,10 @@ services:
       # session, instead of guessing (a wrong guess spends someone else's
       # Content ID). 0 falls back to the shared account: no isolation.
       FFXI_REQUIRE_SIGNED_IN: "${FFXI_REQUIRE_SIGNED_IN:-1}"
+      # Only a POL session opened from the client's own address may be
+      # attributed to it. Set 0 only where POL and the bridge see every client
+      # as a different NAT address (a Docker Desktop dev stack).
+      FFXI_REQUIRE_SAME_ADDRESS: "${FFXI_REQUIRE_SAME_ADDRESS:-1}"
       # Diagnostics under /logs: raw lobby packets, and the world UDP flows
       # (one JSON line per datagram, bounded per flow and by file count).
       FFXI_PKT_DIR: /logs/pkt

@@ -823,6 +823,30 @@ AMBIGUOUS_WINDOW = float(os.environ.get("FFXI_AMBIGUOUS_WINDOW", "900"))
 #: barred that member from creating a character for the life of the bridge, alone
 #: or not. Ambiguity is a property of ONE attribution, not of a member.
 AMBIGUOUS_MARK = "[AMBIGUOUS: creation blocked]"
+#: Only a POL session opened FROM THIS CLIENT'S ADDRESS may be attributed to it.
+#: Default ON. When the address was only the last tie-breaker, any miss on the
+#: exact match (the player's own session not flagged signed in, or its address
+#: recorded differently) sent the launch to whichever OTHER member had fetched
+#: their list most recently, and a player on their own IP was shown someone
+#: else's characters. A refusal costs one relogin; a crossed list shows one
+#: player another's characters and lets a create land on the wrong account.
+#: Set 0 ONLY where every client shares a NAT address that differs between POL
+#: and the bridge (a Docker Desktop dev stack, where each side sees its own
+#: bridge gateway address).
+REQUIRE_SAME_ADDRESS = os.environ.get("FFXI_REQUIRE_SAME_ADDRESS", "1") == "1"
+
+
+def _norm_ip(ip):
+    """`::ffff:1.2.3.4`, `[1.2.3.4]` and `1.2.3.4` are one client."""
+    import ipaddress
+    s = (ip or "").strip().strip("[]")
+    try:
+        a = ipaddress.ip_address(s)
+    except ValueError:
+        return s
+    if getattr(a, "ipv4_mapped", None):
+        a = a.ipv4_mapped
+    return str(a)
 
 
 def resolve_pol_member(client_ip):
@@ -859,11 +883,13 @@ def resolve_pol_member(client_ip):
         log("member", f"cannot read {POL_SESSIONS} ({exc!r}); no member context")
         return None, "unreadable"
     now = time.time()
+    client_ip = _norm_ip(client_ip)
     with _claimed_lock:
         for sid in [s for s, t in _claimed_sids.items() if now - t > CLAIM_TTL]:
             del _claimed_sids[sid]
         claimed = set(_claimed_sids)
     cands = []
+    elsewhere = []
     for sid, ent in (raw.items() if isinstance(raw, dict) else []):
         if not isinstance(ent, dict) or not ent.get("member_id"):
             continue
@@ -871,13 +897,25 @@ def resolve_pol_member(client_ip):
         if now - at > POL_SESSION_MAX_AGE:
             continue
         chars_at = float(ent.get("chars_at") or 0)
-        peer = ent.get("peer_ip") or ""
+        peer = _norm_ip(ent.get("peer_ip"))
         signed_in = bool(ent.get("viewer_open"))
+        if REQUIRE_SAME_ADDRESS and peer != client_ip:
+            # Another address is another player. Never a candidate.
+            elsewhere.append(f"member {ent['member_id']} @ {peer or '?'}"
+                             f"{'' if signed_in else ' (not signed in)'}")
+            continue
         # sort key: unclaimed, SIGNED IN, launched-recently, active-recently, same-IP
         cands.append(((sid in claimed), (not signed_in), -chars_at, -at,
                       peer != client_ip, sid, int(ent["member_id"]), chars_at,
                       signed_in))
     if not cands:
+        if elsewhere:
+            log("member", f"{client_ip}: no POL session from this address; "
+                          f"REFUSING rather than serve another player's "
+                          f"characters. Live sessions elsewhere: "
+                          f"{', '.join(elsewhere[:8])}"
+                          f"{' ...' if len(elsewhere) > 8 else ''}")
+            return None, f"no POL session from {client_ip}"
         return None, "no live POL session"
     cands.sort()
 

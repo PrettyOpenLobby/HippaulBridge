@@ -128,9 +128,11 @@ client keeps that character's macros and settings under `USER/<hex id>/`.
 Attribution needs a signed-in Viewer session. The FFXI lobby stream carries no
 PlayOnline identity, so the bridge reads OpenLobby's session table: one
 signed-in session at the client's address is the answer; two behind one NAT
-are told apart by which one has already launched; a launch that cannot be
-attributed is refused (`FFXI_REQUIRE_SIGNED_IN=1`) rather than guessed, since
-a wrong guess spends someone else's Content ID. A client-side helper that
+are told apart by which one has already launched; a session from any other
+address is never a candidate (`FFXI_REQUIRE_SAME_ADDRESS=1`), and a launch
+that cannot be attributed is refused (`FFXI_REQUIRE_SIGNED_IN=1`) rather than
+guessed, since a wrong guess shows one player another's characters and spends
+their Content ID. A client-side helper that
 stamps the session id into the first lobby packet removes the inference
 entirely; the bridge honours that stamp when present.
 
@@ -213,7 +215,10 @@ CONF channel is the PlayOnline lobby, not LSB's.
 - **The bridge log says "no signed-in POL session ... refusing the launch".**
   The Viewer's session was not marked signed in (OpenLobby restarted since
   the login, or the launch came from an address no session matches). Sign out
-  of the Viewer, sign back in, launch again.
+  of the Viewer, sign back in, launch again. The log line `no POL session from
+  this address; REFUSING` means sessions exist but only at other addresses:
+  the Viewer and FFXI reached the host from different addresses (a proxy, or
+  a dev stack behind Docker NAT, where `FFXI_REQUIRE_SAME_ADDRESS=0` applies).
 - **`search` fails to start with "port is already allocated".** Something
   else on the host holds 54002 (an older OpenLobby release published it from
   an observation logger; current releases do not).
