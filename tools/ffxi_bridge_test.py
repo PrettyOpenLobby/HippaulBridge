@@ -48,6 +48,9 @@ os.environ["FFXI_ACCTMAP_FILE"] = os.path.join(TMP, "ffxi_accounts.json")
 os.environ["POL_AUTH_SESSIONS"] = os.path.join(TMP, "auth-sessions.json")
 os.environ["FFXI_PKT_DUMP"] = "0"
 os.environ["FFXI_WORLD_CAPTURE"] = "0"
+# The 0x14 hook would otherwise start a timer that dials a database this test
+# does not have; the sweep logic is driven with a fake cursor below.
+os.environ["FFXI_TOMBSTONE_DELETED"] = "0"
 sys.path.insert(0, os.path.join(HERE, os.pardir, "lsb"))
 import ffxi_bridge as B  # noqa: E402
 
@@ -321,6 +324,79 @@ check(B.rewrite_s2c(HANDOFF, "T", None, "192.168.0.50:61709") == HANDOFF,  # gen
 check(B._parse_advertise_map("garbage,10.0.0.0/8=10.0.0.5")[0][2] == "10.0.0.5",  # generic example address; polcheck: allow
       "a malformed map entry is skipped, the good one kept")
 B.ADVERTISE_MAP, B.WORLD_ID_FIX = _saved_map, _saved_fix
+
+# ---------------------------------------------------------------------------
+# A deleted character's NAME is freed (LSB soft-deletes and keeps the name)
+print("\n[deleted names] LSB parks a deleted row with accid = 0; the bridge tombstones it")
+if hasattr(B, "tombstone_deleted_rows"):
+    class FakeCur:
+        def __init__(self, rows):
+            self.rows, self.sql, self.rowcount = rows, [], 0
+
+        def execute(self, q, args=()):
+            self.sql.append((q, tuple(args)))
+            self.rowcount = 1 if q.startswith("UPDATE") else 0
+
+        def fetchall(self):
+            return list(self.rows)
+
+    cur = FakeCur([(14, "Examplechar", 1013), (2, "del2", 1001), (20, "Delmar", 1005)])
+    done = B.tombstone_deleted_rows(cur)
+    check(done == [(14, "Examplechar", 1013), (20, "Delmar", 1005)],
+          "every parked row not yet tombstoned is renamed (a real name starting 'del' too)")
+    ups = [a for q, a in cur.sql if q.startswith("UPDATE")]
+    check(ups == [("del14", 14, "Examplechar"), ("del20", 20, "Delmar")],
+          "renamed to del<charid>, guarded by charid AND accid = 0 AND the name just read")
+    check(all("accid = 0" in q for q, _ in cur.sql),
+          "no statement can touch a row that still belongs to an account")
+    check(any(ch.isdigit() for ch in B.tombstone_name(14)),
+          "the tombstone holds a digit, which LSB's create validator never accepts")
+    _calls = []
+    _saved_sched = B.schedule_tombstone
+    B.schedule_tombstone = lambda why, delay=None: _calls.append(why)
+    reset([30000401, 30000402])
+    B._idmap["1"] = 30000401
+    B.rewrite_c2s(c2s(0x14, 30000401), "c->s", 8, K)
+    B.schedule_tombstone = _saved_sched
+    check(bool(_calls) and "charid 1" in _calls[0],
+          "a client's 0x14 schedules a sweep for that charid")
+    check(B.tombstone_deleted_names(why="test") is None,
+          "with FFXI_TOMBSTONE_DELETED=0 a sweep is a no-op (no DB is touched here)")
+else:
+    check(False, "bridge has no tombstone_deleted_rows")
+
+# ---------------------------------------------------------------------------
+# A parked charid gives its Content ID back even if a stale list re-paired it
+print("\n[parked ids] a deleted charid re-paired by a stale char list is released by the sweep")
+if hasattr(B, "release_parked"):
+    # Member 26 holds ONE Content ID; charid 14 is deleted, released on the
+    # 0x14 and re-paired by a stale list, so charid 17 (the recreated
+    # character) finds no free id -> FFXI-3120 at select.
+    reset([30000181])
+    B._idmap["14"] = 30000181
+    B.rewrite_c2s(c2s(0x14, 30000181), "c->s", 26, K)
+    check("14" not in B._idmap, "the 0x14 releases charid 14")
+    B.content_id_for(14, member_id=26)
+    check(B._idmap.get("14") == 30000181, "a list that still carries charid 14 re-pairs it")
+    check(B.content_id_for(17, member_id=26) is None,
+          "...so the recreated charid 17 has no free id (the field failure)")
+
+    class ParkedCur:
+        def execute(self, q, args=()):
+            self.q = q
+
+        def fetchall(self):
+            return [(14,), (2,)]
+    parked = B.parked_charids(ParkedCur())
+    check(parked == [2, 14], "parked_charids reads every accid = 0 row")
+    check(B.release_parked(parked, why="test") == [14],
+          "the sweep releases only parked charids still in the map")
+    check(B.content_id_for(17, member_id=26) == 30000181,
+          "and charid 17 then gets the member's Content ID")
+    check(B.release_parked([17], why="test") == [17] and "17" not in B._idmap,
+          "(sanity) release_parked acts on what it is given; only the SELECT decides 'parked'")
+else:
+    check(False, "bridge has no release_parked")
 
 # ---------------------------------------------------------------------------
 shutil.rmtree(TMP, ignore_errors=True)

@@ -125,6 +125,14 @@ minted. Deleting a character releases its Content ID back to that member's
 pool. A Content ID, once served to a client, is never re-minted or moved: the
 client keeps that character's macros and settings under `USER/<hex id>/`.
 
+LSB's delete is a soft delete: it parks the row (`accid = 0`) and keeps the
+name, and its create check still finds that name, so a deleted character's
+name could never be used again. The bridge renames every parked row to
+`del<charid>` (a name the client cannot type) at startup, a few seconds after
+each delete and every ten minutes, which frees the name and keeps the row for
+recovery. The same sweep releases the Content ID of any parked charid a stale
+character list re-paired. `FFXI_TOMBSTONE_DELETED=0` turns it off.
+
 Attribution needs a signed-in Viewer session. The FFXI lobby stream carries no
 PlayOnline identity, so the bridge reads OpenLobby's session table: one
 signed-in session at the client's address is the answer; two behind one NAT

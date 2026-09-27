@@ -219,6 +219,9 @@ services:
       # attributed to it. Set 0 only where POL and the bridge see every client
       # as a different NAT address (a Docker Desktop dev stack).
       FFXI_REQUIRE_SAME_ADDRESS: "${FFXI_REQUIRE_SAME_ADDRESS:-1}"
+      # LSB soft-deletes a character and keeps its name taken; the bridge
+      # renames each parked row to del<charid> so the name can be reused.
+      FFXI_TOMBSTONE_DELETED: "${FFXI_TOMBSTONE_DELETED:-1}"
       # Diagnostics under /logs: raw lobby packets, and the world UDP flows
       # (one JSON line per datagram, bounded per flow and by file count).
       FFXI_PKT_DIR: /logs/pkt

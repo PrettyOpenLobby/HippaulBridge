@@ -1635,6 +1635,8 @@ def rewrite_c2s(pkt, label, member_id=None, ckey=None, ambiguous=False):
         # Safe if the delete then fails: the character reappears in the next 0x20
         # and is paired again, drawing the same id back out of the member's pool.
         release_charid(cid, why=f"deleted (cmd 0x{cmd:02x})")
+        # And free its NAME once LSB has parked the row (see tombstone_*).
+        schedule_tombstone(f"charid {cid} deleted by the client")
     return bytes(out)
 
 
@@ -2631,6 +2633,137 @@ LSB_DB_USER  = os.environ.get("LSB_DB_USER", "xiadmin")
 LSB_DB_PASS  = os.environ.get("LSB_DB_PASSWORD", "")
 
 
+# ---------------------------------------------------------------------------
+# A DELETED CHARACTER KEEPS ITS NAME -- LSB's delete is a SOFT delete.
+#
+# The lobby's 0x14 handler (lsb-server src/login/view_session.cpp) does NOT drop
+# the row: it runs `UPDATE chars SET accid = 0, original_accid = <acct>` so the
+# character can be recovered by hand. The create check
+# (login_helpers.cpp::characterCreationError) then asks
+# `SELECT charname FROM chars WHERE charname LIKE ?` with NO accid filter, so the
+# parked row still matches and the client is told "Name already in use" for
+# ever: a deleted character's name can never be created again.
+#
+# We run upstream's prebuilt image and cannot change that query, but we do hold
+# the database (the import endpoint writes it already). So: rename every parked
+# row to a TOMBSTONE the client can never type -- `del<charid>` has a digit, and
+# LSB's own validator rejects any non-letter on create -- which frees the name
+# and keeps the row (original_accid intact, old name in our log) for recovery.
+# Only rows with accid = 0 are ever touched; a refused delete leaves no such
+# row, so the timing of the sweep can not hurt anything.
+#
+# Runs at startup, a few seconds after every 0x14 (LSB's UPDATE follows its
+# reply, so "immediately" would be too early), and periodically as a backstop
+# for deletes the bridge did not see (a hand purge, a restart mid-delete).
+TOMBSTONE_DELETED = os.environ.get("FFXI_TOMBSTONE_DELETED", "1") == "1"
+#: Seconds between backstop sweeps (0 = startup + per-delete only).
+TOMBSTONE_PERIOD  = float(os.environ.get("FFXI_TOMBSTONE_PERIOD", "600"))
+#: Seconds to wait after a client's 0x14 before renaming: LSB replies to the
+#: delete FIRST and updates the row after, on the same thread.
+TOMBSTONE_DELAY   = float(os.environ.get("FFXI_TOMBSTONE_DELAY", "3"))
+_tombstone_lock = threading.Lock()
+
+
+def tombstone_name(charid):
+    """The name a parked row is renamed to. Contains a digit, so no client can
+    ever create it: LSB rejects any non-letter at create time."""
+    return f"del{int(charid)}"
+
+
+def tombstone_deleted_rows(cur):
+    """Rename every soft-deleted row on an open cursor. Returns the rows it
+    renamed as (charid, old_name, original_accid). Pure DB logic, no logging,
+    so the test can drive it with a fake cursor."""
+    cur.execute("SELECT charid, charname, original_accid FROM chars WHERE accid = 0")
+    done = []
+    for charid, name, orig in list(cur.fetchall() or ()):
+        want = tombstone_name(charid)
+        if name == want:
+            continue
+        # accid = 0 AND the name we just read: never touch a row that came back
+        # (a hand recovery between the read and the write) or one already renamed.
+        cur.execute("UPDATE chars SET charname = %s "
+                    "WHERE charid = %s AND accid = 0 AND charname = %s",
+                    (want, charid, name))
+        if getattr(cur, "rowcount", 1):
+            done.append((int(charid), name, orig))
+    return done
+
+
+def parked_charids(cur):
+    """Every soft-deleted charid, tombstoned or not, on an open cursor."""
+    cur.execute("SELECT charid FROM chars WHERE accid = 0")
+    return sorted(int(r[0]) for r in (cur.fetchall() or ()))
+
+
+def release_parked(charids, why=""):
+    """Release the Content ID of every parked charid still in the map.
+
+    The 0x14 hook releases on the client's request, but a char list that
+    still carries the charid re-pairs it through the refused-delete branch of
+    `content_id_for`. When that happens the member's only Content ID stays
+    spent, the recreated character goes out untranslated and the client
+    shows FFXI-3120. A row with accid = 0 is LSB's own word that the delete
+    happened, so the sweep settles it here. Returns the charids released."""
+    freed = []
+    for charid in charids:
+        with _idmap_lock:
+            held = str(charid) in _idmap
+        if held and release_charid(charid, why=f"parked by LSB (accid = 0) -- {why}"):
+            freed.append(int(charid))
+    return freed
+
+
+def tombstone_deleted_names(why=""):
+    """One sweep against the live database. Never raises."""
+    if not TOMBSTONE_DELETED:
+        return None
+    with _tombstone_lock:
+        conn, err = session_key_connect()
+        if conn is None:
+            log("tombstone", f"sweep skipped ({err}) -- {why}")
+            return None
+        try:
+            with conn.cursor() as cur:
+                done = tombstone_deleted_rows(cur)
+                parked = parked_charids(cur)
+            conn.commit()
+        except Exception as exc:
+            log("tombstone", f"sweep failed: {exc} -- {why}")
+            return None
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    release_parked(parked, why=why or "periodic sweep")
+    for charid, name, orig in done:
+        log("tombstone", f"charid {charid} {name!r} (deleted from LSB account {orig}) "
+                         f"-> {tombstone_name(charid)!r}: the name is free again -- {why}")
+    if not done and why:
+        log("tombstone", f"no parked names -- {why}")
+    return done
+
+
+def schedule_tombstone(why, delay=None):
+    """Sweep in a moment, off the packet path."""
+    if not TOMBSTONE_DELETED:
+        return None
+    t = threading.Timer(TOMBSTONE_DELAY if delay is None else delay,
+                        tombstone_deleted_names, kwargs={"why": why})
+    t.daemon = True
+    t.start()
+    return t
+
+
+def tombstone_loop():
+    """Startup sweep, then the periodic backstop."""
+    tombstone_deleted_names(why="startup")
+    while TOMBSTONE_PERIOD > 0:
+        time.sleep(TOMBSTONE_PERIOD)
+        tombstone_deleted_names(why="")
+
+
 def do_import(dump, member_id):
     """Import a polexport dump for a member. Returns (ok, message, charid)."""
     try:
@@ -2833,6 +2966,10 @@ def main():
                             f"attempt replied {reply}")
         except Exception as e2:
             log("boot", f"WARNING: startup auth failed: {e} (create attempt: {e2})")
+    if TOMBSTONE_DELETED:
+        threading.Thread(target=tombstone_loop, daemon=True).start()
+    else:
+        log("boot", "deleted-name tombstoning OFF (FFXI_TOMBSTONE_DELETED=0)")
     threading.Thread(target=listener, args=(BRIDGE_VIEW, LSB_VIEW_PORT, "VIEW"), daemon=True).start()
     threading.Thread(target=listener, args=(BRIDGE_DATA, LSB_DATA_PORT, "DATA"), daemon=True).start()
     if BRIDGE_MAP:
