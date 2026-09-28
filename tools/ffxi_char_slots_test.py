@@ -40,35 +40,39 @@ The slot count is the FFXI title plugin's (`ffxititle.CHARACTER_SLOTS`, its
 asks for. Section 1b proves that path with a count above one.
 
 Run from tools/: `python ffxi_char_slots_test.py`. Exits non-zero on failure.
-Needs the OpenLobby core's `services/` (accounts.py, responders.py, titles.py): set
-OPENLOBBY_DIR to a checkout of it, or keep one beside this repository as
-../openlobby. Without it the suite SKIPS (exit 77) rather than failing.
+Needs the OpenLobby core's `services/` (accounts.py, responders.py, titles.py)
+and its tools/pgtest.py, which gives every section its own fresh PostgreSQL
+database: set OPENLOBBY_DIR to a checkout of it, or keep one beside this
+repository as ../openlobby. Without it the suite SKIPS (exit 77) rather than
+failing, and so it does without Docker or POL_TEST_DATABASE_URL unless
+POL_TEST_REQUIRE_DB=1.
 """
 
 import os
 import shutil
-import sqlite3
 import struct
 import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from openlobby_paths import require_services                      # noqa: E402
+from openlobby_paths import require_database, require_services    # noqa: E402
 SERVICES = require_services("ffxi_char_slots_test")
 
 TMP = tempfile.mkdtemp(prefix="ffxi-char-slots-")
-os.environ["POL_ACCOUNTS_DB"] = os.path.join(TMP, "accounts.db")
 os.environ["POL_DATA_DIR"] = TMP
 os.environ["POL_LOG_DIR"] = TMP
 os.environ["POL_RESOURCE_DIR"] = os.path.join(TMP, "resources")
+_DBS = {"accounts": require_database("ffxi_char_slots_test")}
 
 import accounts as A                                               # noqa: E402
 import responders as R                                             # noqa: E402
+import pgtest                                                      # noqa: E402
 
 LSB = os.path.join(HERE, os.pardir, "lsb")
 sys.path.insert(0, LSB)
 import ffxititle as X                                              # noqa: E402
+import ffxidb                                                      # noqa: E402
 TITLE = X.register()          # what POL_TITLES=ffxititle does in the core
 
 FAILED = []
@@ -80,12 +84,18 @@ def check(ok, label):
         FAILED.append(label)
 
 
-def fresh_db(name="accounts.db"):
-    path = os.path.join(TMP, name)
-    for suffix in ("", "-wal", "-shm"):
-        if os.path.exists(path + suffix):
-            os.remove(path + suffix)
-    return A.connect(path)
+def fresh_db(name):
+    """A new, empty account database for one section, and this process
+    pointed at it. Dropped when the suite exits."""
+    _DBS[name] = pgtest.use_fresh_database()
+    return A.connect(_DBS[name])
+
+
+def use_db(name):
+    """Point this process back at a section's database. A connection object
+    borrows from the process's pool per statement, so this is what decides
+    which database every open connection (and responders) reads."""
+    return A.connect(_DBS[name])
 
 
 def ffxi_ids(db, handle_id):
@@ -98,7 +108,7 @@ N = X.CHARACTER_SLOTS
 # --------------------------------------------------------------------------- #
 print("1. A NEW ACCOUNT GETS ITS FFXI CHARACTER SLOTS (want %d)" % N)
 
-db = fresh_db()
+db = use_db("accounts")
 A.create_polid(db, "SLOTS1", "pw-account")
 mid = A.add_member(db, "SLOTS1", "slots-one", "pw-member")
 A.set_handle(db, mid, "Tester")
@@ -112,7 +122,7 @@ check(len(ids) == N, "the handle holds %d FFXI Content ID(s) (got %d: %s)"
 check(len(set(ids)) == len(ids), "...all distinct (%s)" % (ids,))
 dupes = db.execute(
     "SELECT content_id, COUNT(*) n FROM handle_content WHERE content_id IS NOT NULL"
-    " GROUP BY content_id HAVING n > 1").fetchall()
+    " GROUP BY content_id HAVING COUNT(*) > 1").fetchall()
 check(not dupes, "no Content ID appears twice anywhere in the DB (%s)"
       % ([dict(r) for r in dupes],))
 slots = sorted(int(r["slot"]) for r in A.handle_content_list(db, hid)
@@ -143,7 +153,7 @@ print("1b. THE TITLE'S SLOT COUNT IS WHAT THE ACCOUNT DATABASE MINTS")
 # the per-title rule and the login top-up each have something to prove.
 check(A.content_slots_for(X.CONTENT_CODE) == N,
       "accounts reads the plugin's count (%d)" % A.content_slots_for(X.CONTENT_CODE))
-db1 = fresh_db("hook.db")
+db1 = fresh_db("hook")
 A.create_polid(db1, "HOOK", "pw-account")
 hm = A.add_member(db1, "HOOK", "hook", "pw-member")
 A.set_handle(db1, hm, "Hooked")
@@ -173,7 +183,7 @@ try:
     check(len(ffxi_ids(db1, ph)) == 3,
           "placing the title mints the plugin's 3 (%d)" % len(ffxi_ids(db1, ph)))
     reg = A.register_account(db1, "Hookreg", "password123", contents=(1, 2))
-    rh = db1.execute("SELECT id FROM handle WHERE member_id = ?",
+    rh = db1.execute("SELECT id FROM handle WHERE member_id = %s",
                      (reg["member_id"],)).fetchone()["id"]
     check(len(ffxi_ids(db1, rh)) == 3,
           "registration mints the plugin's 3 in its one transaction (%d)"
@@ -186,66 +196,44 @@ db1.close()
 print()
 print("2. AN ACCOUNT THAT ALREADY EXISTS IS TOPPED UP, AND NOTHING MOVES")
 
-# Build the PRE-SLOT schema by hand: this is what every account created before
-# the slot column existed looks like, and the point of the check is that the id it is
-# already serving does not change. A re-mint here costs that player every macro
-# they ever wrote.
-legacy = os.path.join(TMP, "legacy.db")
-if os.path.exists(legacy):
-    os.remove(legacy)
-raw = sqlite3.connect(legacy)
-raw.executescript("""
-CREATE TABLE polid (id INTEGER PRIMARY KEY AUTOINCREMENT, polid TEXT UNIQUE,
-                    pw_hash TEXT, pw_salt TEXT, created_at TEXT);
-CREATE TABLE member (id INTEGER PRIMARY KEY AUTOINCREMENT, polid TEXT,
-                     member_no INTEGER DEFAULT 0, login_name TEXT, pw_hash TEXT,
-                     pw_salt TEXT, access_level INTEGER DEFAULT 0,
-                     status TEXT DEFAULT 'active', created_at TEXT);
-CREATE TABLE handle (id INTEGER PRIMARY KEY AUTOINCREMENT, member_id INTEGER,
-                     handle_name TEXT, is_primary INTEGER DEFAULT 1,
-                     created_at TEXT, client_guid INTEGER DEFAULT 0);
-CREATE TABLE handle_content (handle_id INTEGER NOT NULL, content_code INTEGER NOT NULL,
-                             content_id TEXT, status TEXT NOT NULL DEFAULT 'active',
-                             linked_at TEXT NOT NULL,
-                             PRIMARY KEY (handle_id, content_code));
-INSERT INTO polid  VALUES (1, 'LEGACY', 'h', 's', '2026-08-01T00:00:00Z');
-INSERT INTO member VALUES (1, 'LEGACY', 0, 'LEGACY', 'h', 's', 0, 'active',
-                           '2026-08-01T00:00:00Z');
-INSERT INTO handle VALUES (1, 1, 'Legacy', 1, '2026-08-01T00:00:00Z', 0);
-INSERT INTO handle_content VALUES (1, 1, '30000037', 'active', '2026-08-22T02:13:28Z');
-INSERT INTO handle_content VALUES (1, 2, '30000038', 'active', '2026-08-22T02:13:28Z');
-""")
-raw.commit()
-raw.close()
+# The PRE-SLOT shape, written by hand: one row per title at slot 0, which is
+# what every account created before the slot column existed holds (an import
+# of such an accounts.db lands exactly like this). The point of the check is
+# that the id it is already serving does not change. A re-mint here costs that
+# player every macro they ever wrote.
+db2 = fresh_db("legacy")
+A.create_polid(db2, "LEGACY", "pw-account")
+lmid = A.add_member(db2, "LEGACY", "legacy", "pw-member")
+LH = A.set_handle(db2, lmid, "Legacy")
+for code, cid in ((1, "30000037"), (2, "30000038")):
+    db2.execute("INSERT INTO handle_content (handle_id, content_code, slot,"
+                " content_id, status, linked_at) VALUES (%s,%s,0,%s,'active',%s)",
+                (LH, code, cid, "2026-08-22T02:13:28Z"))
+db2.commit()
 
-db2 = A.connect(legacy)                       # runs _migrate, i.e. the rebuild
-cols = set(r["name"] for r in db2.execute("PRAGMA table_info(handle_content)"))
-check("slot" in cols, "the migration added the slot column")
-
-after = ffxi_ids(db2, 1)
-check("30000037" in after, "the served FFXI id survived the migration (%s)" % (after,))
-row = db2.execute("SELECT slot FROM handle_content WHERE handle_id = 1"
-                  " AND content_code = 1 AND content_id = '30000037'").fetchone()
+minted = A.ensure_title_slots(db2)            # what the schema step runs
+after = ffxi_ids(db2, LH)
+check("30000037" in after, "the served FFXI id survived the top-up (%s)" % (after,))
+row = db2.execute("SELECT slot FROM handle_content WHERE handle_id = %s"
+                  " AND content_code = 1 AND content_id = '30000037'",
+                  (LH,)).fetchone()
 check(row is not None and int(row["slot"]) == 0,
       "...and it is slot 0, i.e. still the handle's FFXI identity")
 check(len(after) == N, "...and the handle was topped up to %d (%d)" % (N, len(after)))
-tm2 = [r["content_id"] for r in A.handle_content_list(db2, 1)
+tm2 = [r["content_id"] for r in A.handle_content_list(db2, LH)
        if int(r["content_code"]) == 2]
 check(tm2 == ["30000038"], "the Tetra Master id was left alone (%s)" % (tm2,))
-kept = db2.execute("SELECT COUNT(*) n FROM handle_content_pre_slots").fetchone()["n"]
-check(int(kept) == 2, "the pre-migration rows are kept for recovery (%s)" % (kept,))
 
 # Idempotent: running it again must not mint a second set.
 again = A.ensure_title_slots(db2)
 check(again == 0, "a second top-up mints nothing (%s)" % (again,))
-check(len(ffxi_ids(db2, 1)) == N, "...and the count is unchanged")
+check(len(ffxi_ids(db2, LH)) == N, "...and the count is unchanged")
 
 # A handle that does NOT hold FFXI gets nothing -- entitlement is `content`, and
 # this must not hand the title to everybody.
-db2.execute("INSERT INTO handle VALUES (2, 1, 'NoFFXI', 0, '2026-08-01T00:00:00Z', 0)")
-db2.commit()
+NH = A.set_handle(db2, lmid, "NoFFXI", primary=False)
 A.ensure_title_slots(db2)
-check(not ffxi_ids(db2, 2), "a handle without FFXI is not given any")
+check(not ffxi_ids(db2, NH), "a handle without FFXI is not given any")
 
 # --------------------------------------------------------------------------- #
 print()
@@ -255,7 +243,7 @@ print("3. MOVING A TITLE BETWEEN HANDLES CARRIES EVERY SLOT")
 # code off the sibling handles and re-INSERT one row. With one id per game that
 # was lossless. With four it would silently destroy three Content IDs -- and an
 # id that has been served cannot be re-minted.
-db3 = fresh_db("move.db")
+db3 = fresh_db("move")
 A.create_polid(db3, "MOVE", "pw-account")
 mm = A.add_member(db3, "MOVE", "mover", "pw-member")
 A.set_handle(db3, mm, "First")
@@ -267,7 +255,7 @@ check(len(before_ids) == N, "the source handle holds %d (%s)"
       % (N, sorted(before_ids)))
 
 db3.execute("INSERT INTO handle (member_id, handle_name, is_primary, created_at,"
-            " client_guid) VALUES (?,?,0,?,0)", (mm, "Second", "2026-09-03T00:00:00Z"))
+            " client_guid) VALUES (%s,%s,0,%s,0)", (mm, "Second", "2026-09-03T00:00:00Z"))
 db3.commit()
 h2 = db3.execute("SELECT id FROM handle WHERE handle_name = 'Second'").fetchone()["id"]
 A.link_content_to_handle(db3, h2, X.CONTENT_CODE)
@@ -282,7 +270,7 @@ check(moved_slots == list(range(N)),
       "slots renumbered without a gap (%s)" % (moved_slots,))
 dupes3 = db3.execute(
     "SELECT content_id, COUNT(*) n FROM handle_content WHERE content_id IS NOT NULL"
-    " GROUP BY content_id HAVING n > 1").fetchall()
+    " GROUP BY content_id HAVING COUNT(*) > 1").fetchall()
 check(not dupes3, "the move did not duplicate an id (%s)"
       % ([dict(r) for r in dupes3],))
 
@@ -304,8 +292,7 @@ print("4. THE WIRE NEVER CARRIES A NINTH CONTENT ID FOR ONE HANDLE")
 # So the check is not "are the extras encoded correctly" any more. It is: given
 # a handle holding MORE than the ceiling, does the wire carry eight?
 REC = 104
-over = fresh_db("overflow.db")
-os.environ["POL_ACCOUNTS_DB"] = os.path.join(TMP, "overflow.db")
+over = fresh_db("overflow")
 A.create_polid(over, "OVERFLW", "pw-account")
 omid = A.add_member(over, "OVERFLW", "overflow", "pw-member")
 A.set_handle(over, omid, "Tester")
@@ -318,7 +305,7 @@ A.link_member_content_to_primary(over, omid)
 # and the input to 4a has to be an over-ceiling handle or it proves nothing.
 for slot in (1, 2, 3):
     over.execute("INSERT INTO handle_content (handle_id, content_code, slot,"
-                 " content_id, status, linked_at) VALUES (?,1,?,?,'active',?)",
+                 " content_id, status, linked_at) VALUES (%s,1,%s,%s,'active',%s)",
                  (ohid, slot, "3000099%d" % slot, "2026-09-22T00:00:00Z"))
 over.commit()
 held = len(A.handle_content_list(over, ohid))
@@ -342,7 +329,7 @@ check(sorted(rec[1] for rec in served) == list(range(R._CHAR_PER_HANDLE)),
 # 4c. THE MINT ITSELF STOPS AT THE CEILING, so 4a should never have to bite.
 # A fully granted handle asking for four FFXI ids gets none: eight links is
 # every title, and a ninth is the dialog above.
-full = fresh_db("ceiling.db")
+full = fresh_db("ceiling")
 A.create_polid(full, "CEILING", "pw-account")
 fmid = A.add_member(full, "CEILING", "ceiling", "pw-member")
 A.set_handle(full, fmid, "Full")
@@ -356,7 +343,7 @@ check(A.handle_link_count(full, fhid) <= A.CONTENT_IDS_PER_HANDLE,
       "...and holds at most %d Content IDs (%d)"
       % (A.CONTENT_IDS_PER_HANDLE, A.handle_link_count(full, fhid)))
 # A handle with ROOM still gets what fits -- the clamp is a ceiling, not a ban.
-room = fresh_db("room.db")
+room = fresh_db("room")
 A.create_polid(room, "ROOM", "pw-account")
 rmid = A.add_member(room, "ROOM", "room", "pw-member")
 A.set_handle(room, rmid, "Roomy")
@@ -394,19 +381,14 @@ check(bound_codes == set([1, 2, 3, 4, 10, 11, 14, 15]),
 check(all(c == 1 and s > 0 for c, s in order[R._CHAR_PER_HANDLE:]),
       "only extra FFXI slots fall off the end (%s)" % (order[R._CHAR_PER_HANDLE:],))
 
-os.environ["POL_ACCOUNTS_DB"] = os.path.join(TMP, "accounts.db")
-
-
 print()
 print("5. THE BRIDGE SEES THE WHOLE POOL")
 
 # This is the payoff: the bridge offers a member's UNSPENT Content IDs as the
 # client's empty character slots (`rewrite_s2c`), and picks one when the client
 # creates. Pool of one = the failure this suite exists for.
-sys.path.insert(0, os.path.join(HERE, os.pardir, "lsb"))
-os.environ["FFXI_IDMAP_FILE"] = os.path.join(TMP, "idmap.json")
 import ffxi_bridge as B                                            # noqa: E402
-B.ACCOUNTS_DB = os.environ["POL_ACCOUNTS_DB"]
+use_db("accounts")                 # section 1's member, read by the bridge
 pool = B.pol_content_ids(mid)
 check(len(pool) == N,
       "the bridge sees %d FFXI Content ID(s) for the member (%s)" % (N, pool))
@@ -430,33 +412,35 @@ print("6. THE OPERATOR COMMAND THAT CLEANS UP EXISTING ACCOUNTS")
 # The whole risk of the command is in one place: deactivating an id a character
 # is already named after makes that character POL-0001 at select for ever. So
 # the checks below are mostly about what it REFUSES to do.
-import io                                                          # noqa: E402
-import json                                                        # noqa: E402
 import subprocess                                                  # noqa: E402
 
-CLI_DB = os.path.join(TMP, "trim.db")
-IDMAP = os.path.join(TMP, "trim_idmap.json")
-
-cli = fresh_db("trim.db")
+cli = fresh_db("trim")
+CLI_DB = _DBS["trim"]
 acct = A.register_account(cli, "Examplemember05", "password123",
                           contents=(1, 2, 3, 4, 10, 11, 14))
-chid = cli.execute("SELECT id FROM handle WHERE member_id = ?",
+chid = cli.execute("SELECT id FROM handle WHERE member_id = %s",
                    (acct["member_id"],)).fetchone()["id"]
 for slot in (1, 2, 3):                       # what a pre-fix sign-up was minted
     cli.execute("INSERT INTO handle_content (handle_id, content_code, slot,"
-                " content_id, status, linked_at) VALUES (?,1,?,?,'active',?)",
+                " content_id, status, linked_at) VALUES (%s,1,%s,%s,'active',%s)",
                 (chid, slot, "3000099%d" % slot, "2026-09-22T00:00:00Z"))
 cli.commit()
 extras = [r["content_id"] for r in A.handle_content_list(cli, chid)
           if int(r["content_code"]) == 1 and int(r["slot"]) != 0]
-json.dump({"7": {"content_id": int(extras[0]), "name": "Ayla", "world_field": 1}},
-          io.open(IDMAP, "w", encoding="utf-8"))
+
+
+def bridge_map(name):
+    """The bridge's id map: charid 7 on the first extra id, called `name`."""
+    use_db("trim")
+    ffxidb.write_idmap([{"charid": 7, "content_id": int(extras[0]), "name": name,
+                         "world_field": 1, "seen": "2026-09-22T00:00:00Z"}],
+                       replace=True)
 
 
 def trim(*argv):
     # The plugin sits beside the core's modules in the title image; here the
     # core's services/ goes on the path the same way.
-    env = dict(os.environ, PYTHONPATH=SERVICES)
+    env = dict(os.environ, PYTHONPATH=SERVICES, POL_DATABASE_URL=CLI_DB)
     r = subprocess.run([sys.executable, os.path.join(LSB, "ffxititle.py"), CLI_DB,
                         "trim-slots"] + list(argv),
                        cwd=SERVICES, env=env, capture_output=True, text=True)
@@ -473,23 +457,26 @@ def active_extras():
         db.close()
 
 
-rc, out = trim("--idmap", IDMAP)
-check(rc == 0 and active_extras() == 3,
-      "6a. the default is a REPORT and writes nothing (rc %d, %d active)"
-      % (rc, active_extras()))
-check("Ayla IS ON THIS ID" in out,
-      "...and it names the character sitting on an id")
-
 # 6b. THE ONE THAT MATTERS. No id map = no way to know what is in use, so the
-# command must not guess. An empty map must never read as "nothing is in use".
-rc, out = trim("--apply", "--idmap", os.path.join(TMP, "gone.json"))
+# command must not guess. A map that cannot be read must never read as
+# "nothing is in use". The bridge has never run against this database, so its
+# table does not exist yet.
+rc, out = trim("--apply")
 check(rc != 0 and "REFUSING" in out and active_extras() == 3,
       "6b. --apply REFUSES when the id map cannot be read (rc %d, %d active)"
       % (rc, active_extras()))
 check(all(ord(ch) < 127 for ch in out),
       "...and says so in ASCII, which a cp1252 console can actually print")
 
-rc, out = trim("--apply", "--idmap", IDMAP)
+bridge_map("Ayla")
+rc, out = trim()
+check(rc == 0 and active_extras() == 3,
+      "6a. the default is a REPORT and writes nothing (rc %d, %d active)"
+      % (rc, active_extras()))
+check("Ayla IS ON THIS ID" in out,
+      "...and it names the character sitting on an id")
+
+rc, out = trim("--apply")
 check(rc == 0 and active_extras() == 1,
       "6c. --apply trims the free ids and KEEPS the one with a character on it"
       " (%d left)" % active_extras())
@@ -499,24 +486,25 @@ check([r["content_id"] for r in A.handle_content_list(kept, chid)
       "...and the one it kept is Ayla's")
 kept.close()
 
-os.environ["POL_ACCOUNTS_DB"] = CLI_DB
+use_db("trim")
 after = R._db_chars()
 check(len(after) <= R._CHAR_PER_HANDLE and all(rec[4] for rec in after),
       "...so the wire is back under the ceiling, all bound (%d records)"
       % len(after))
-os.environ["POL_ACCOUNTS_DB"] = os.path.join(TMP, "accounts.db")
 
 rc, out = trim("--restore")
 check(rc == 0 and active_extras() == 3,
       "6d. --restore puts back exactly what it deactivated (%d active)"
       % active_extras())
 
-# The bridge has written two map shapes over its life and the in-use check has
-# to understand both, or it reports a live character's id as free.
-json.dump({"7": int(extras[0])}, io.open(IDMAP, "w", encoding="utf-8"))
-rc, out = trim("--idmap", IDMAP)
-check(rc == 0 and "IS ON THIS ID" in out,
-      "6e. the flat legacy id map shape is still understood")
+# A character the bridge has paired but not learned a name for yet (a map
+# imported from the old flat file shape carries no names at all) is still ON
+# its id: the in-use check must not skip it, or it reports a live character's
+# id as free.
+bridge_map("")
+rc, out = trim()
+check(rc == 0 and "charid 7 IS ON THIS ID" in out,
+      "6e. a paired character with no name yet still counts as in use")
 
 # --------------------------------------------------------------------------- #
 print()

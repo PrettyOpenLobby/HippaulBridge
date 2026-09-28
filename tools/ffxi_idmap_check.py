@@ -1,30 +1,27 @@
-"""Do the FFXI id map's WRITER and READER name the same file?
+"""Do the FFXI id map's WRITER and READER use the same database?
 
     python tools/ffxi_idmap_check.py
 
 No containers, no network: it reads this repository's docker-compose.yml (the
-WRITER: the `bridge` service's FFXI_IDMAP_FILE) and the OpenLobby core's
-docker-compose.yml plus its source defaults (the READER: the `login` service's
-POL_FFXI_IDMAP, falling back to services/srvcore.py's RELEASE_DEFAULTS and
-then to the literal in lsb/ffxititle.py (the title plugin), which is the order the core
-applies them in), resolves each path through that service's own volume mounts
-to a Docker volume plus a path inside it, and compares them. It also checks
-that no core service publishes host port 54002, which LSB's search server
-needs.
+WRITER: the `bridge` service's POL_DATABASE_URL) and the OpenLobby core's
+docker-compose.yml with this repository's docker-compose.title.yml on top (the
+READER: the `login` service's POL_DATABASE_URL, where the title plugin
+lsb/ffxititle.py runs), and compares them. It checks that the table the
+bridge's migrations create is the one both sides name, that the bridge waits
+for the database it writes, that the bridge reads the core's session table
+under the key the core writes it, and that no core service publishes host
+port 54002, which LSB's search server needs.
 
 WHY THIS EXISTS -- a bug that ran on a live deployment for days with no symptom
 anybody could see (found 2026-08-23):
 
-  * The **bridge** persists `{charid: {content_id, world_field}}` to
-    `FFXI_IDMAP_FILE`, on the shared data volume as `/data/ffxi_idmap.json`.
-  * The **lobby** reads it back through `POL_FFXI_IDMAP`, whose built-in
-    default in `responders.py` was `/lsb/ffxi_idmap.json`. Nothing set the
-    variable, so the lobby used that default -- a different file, which did
-    not exist.
-  * `_ffxi_world_fields` turned the missing file into `{}` and returned it
-    WITHOUT LOGGING, on the perfectly good reasoning that a stack with no
-    bridge legitimately has no map. So a misconfigured stack looked exactly
-    like an unconfigured one.
+  * The **bridge** persisted `{charid: {content_id, world_field}}` to a file on
+    the shared data volume, `/data/ffxi_idmap.json`.
+  * The **lobby** read it back through a variable whose built-in default named
+    a different file, which did not exist. Nothing set the variable.
+  * The reader turned the missing file into `{}` WITHOUT LOGGING, on the
+    perfectly good reasoning that a stack with no bridge legitimately has no
+    map. So a misconfigured stack looked exactly like an unconfigured one.
 
 The consequence is not cosmetic. The lobby's `1:3` FFXI record carries the world
 identity dword at record `+0x0C`, which comes from this map; FFXI's world lookup
@@ -32,11 +29,12 @@ identity dword at record `+0x0C`, which comes from this map; FFXI's world lookup
 the world socket unless it matches, and on no match writes -1 and aborts --
 **POL-0001**. An empty map means it can never match.
 
-The core now defaults the reader to the shared volume path, so a plain
-deployment agrees by design. This check crosses the two things a plain
-env-var diff cannot -- a value's default in the code, and where the other
-service actually puts the file -- so a re-pinned default, a renamed volume
-or a stray environment override is caught before a player finds it.
+The map is a table in the core's PostgreSQL now (ffxi_idmap), so the file
+paths are gone, but the failure has the same shape: a bridge writing to one
+database and a lobby reading another serves world field 0 to everybody. This
+check crosses the two compose files a plain env-var diff cannot, so a
+re-pointed URL or a stray environment override is caught before a player
+finds it.
 
 The OpenLobby checkout is found through OPENLOBBY_DIR, or as ../openlobby
 beside this repository; without one the check SKIPS (exit 77).
@@ -49,6 +47,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, os.pardir))
 sys.path.insert(0, HERE)
 from openlobby_paths import require_root, skip                      # noqa: E402
+sys.path.insert(0, os.path.join(ROOT, "lsb"))
+import ffxidb                                                       # noqa: E402
 
 READER_SERVICE = "login"
 WRITER_SERVICE = "bridge"
@@ -77,34 +77,14 @@ def load(yaml, path):
         return yaml.safe_load(fh) or {}
 
 
-def read_source(root, *parts):
-    with open(os.path.join(root, *parts), encoding="utf-8") as fh:
+def read_source(*parts):
+    with open(os.path.join(ROOT, *parts), encoding="utf-8") as fh:
         return fh.read()
 
 
-def title_default():
-    """`POL_FFXI_IDMAP`'s literal fallback in the title plugin, lsb/ffxititle.py
-    (the reader runs inside the core's login process)."""
-    m = re.search(r'IDMAP\s*=\s*os\.environ\.get\(\s*"POL_FFXI_IDMAP"\s*,\s*'
-                  r'"([^"]+)"\s*\)', read_source(ROOT, "lsb", "ffxititle.py"))
-    return m.group(1) if m else None
-
-
 def expand_default(value):
-    """`${VAR:-default}` as compose expands it with VAR unset."""
-    m = re.fullmatch(r"\$\{[A-Za-z_][A-Za-z0-9_]*:-([^}]*)\}", value or "")
-    return m.group(1) if m else value
-
-
-def release_default(root):
-    """`POL_FFXI_IDMAP` in srvcore.py's RELEASE_DEFAULTS, applied with
-    os.environ.setdefault before the title plugin reads the variable."""
-    src = read_source(root, "services", "srvcore.py")
-    m = re.search(r"RELEASE_DEFAULTS\s*=\s*\{(.*?)\n\}", src, re.S)
-    if not m:
-        return None
-    v = re.search(r'"POL_FFXI_IDMAP"\s*:\s*"([^"]+)"', m.group(1))
-    return v.group(1) if v else None
+    """`${VAR:-default}` inside a value, as compose expands it with VAR unset."""
+    return re.sub(r"\$\{[A-Za-z_][A-Za-z0-9_]*:-([^}]*)\}", r"\1", value or "")
 
 
 def service(doc, name):
@@ -124,46 +104,9 @@ def env_of(svc):
     return {}
 
 
-def volume_name(doc, key, project):
-    """The Docker volume a compose volume key maps to."""
-    spec = (doc.get("volumes") or {}).get(key) or {}
-    if isinstance(spec, dict) and spec.get("name"):
-        return spec["name"]
-    return f"{project}_{key}"
-
-
-def mounts_of(svc, doc, project):
-    """`[(volume-or-host, container_path)]` for the service's mounts."""
-    out = []
-    for v in svc.get("volumes") or []:
-        if not isinstance(v, str):
-            continue
-        parts = v.split(":")
-        if len(parts) < 2:
-            continue
-        src, dst = parts[0], parts[1]
-        if src.startswith((".", "/", "$")):
-            src = "bind:" + re.sub(r"^\$\{[A-Za-z_][A-Za-z0-9_]*\}", "", src).strip("./")
-        else:
-            src = "volume:" + volume_name(doc, src, project)
-        out.append((src, dst))
-    return out
-
-
-def resolve(container_path, mounts):
-    """`volume:<name>/<rest>` for a path inside a container, or None.
-    Longest matching mount wins, the way the kernel resolves them."""
-    best = None
-    for src, dst in mounts:
-        d = dst.rstrip("/")
-        if container_path == d or container_path.startswith(d + "/"):
-            if best is None or len(d) > len(best[1].rstrip("/")):
-                best = (src, dst)
-    if best is None:
-        return None
-    src, dst = best
-    rest = container_path[len(dst.rstrip("/")):].lstrip("/")
-    return "/".join(p for p in (src, rest) if p)
+def url_host(url):
+    m = re.match(r"^[a-z]+://(?:[^@/]*@)?([^:/]+)", url or "")
+    return m.group(1) if m else None
 
 
 def published_host_ports(svc):
@@ -187,55 +130,69 @@ def main():
 
     # --- the writer: this repository ------------------------------------
     here_doc = load(yaml, os.path.join(ROOT, "docker-compose.yml"))
-    here_project = here_doc.get("name") or os.path.basename(ROOT)
     writer = service(here_doc, WRITER_SERVICE)
     if not check(bool(writer), f"a {WRITER_SERVICE!r} service exists in docker-compose.yml"):
         return 1
-    w_env = env_of(writer).get("FFXI_IDMAP_FILE")
-    w_host = resolve(w_env or "", mounts_of(writer, here_doc, here_project))
-    print(f"  writer {WRITER_SERVICE}: FFXI_IDMAP_FILE={w_env} -> {w_host}")
-    check(bool(w_env), "the bridge sets FFXI_IDMAP_FILE explicitly")
-    check(w_host is not None,
-          f"the writer's path {w_env} is inside a mount of {WRITER_SERVICE}")
-    check(w_host is not None and w_host.startswith("volume:"),
-          "the writer's file is on a named volume (not a bind mount)")
+    w_env = env_of(writer)
+    w_url = expand_default(w_env.get("POL_DATABASE_URL"))
+    print(f"  writer {WRITER_SERVICE}: POL_DATABASE_URL={w_url or None}")
+    check(bool(w_url), "the bridge sets POL_DATABASE_URL explicitly")
+    stale = sorted(k for k in ("FFXI_IDMAP_FILE", "FFXI_ACCTMAP_FILE", "POL_ACCOUNTS_DB")
+                   if k in w_env)
+    check(not stale, f"the bridge sets none of the retired file knobs ({stale or 'none'})")
 
-    # --- the reader: the OpenLobby core ------------------------------------
+    # --- the reader: the OpenLobby core, with the title override on top ---
     print(f"  reader: {core}")
     core_doc = load(yaml, os.path.join(core, "docker-compose.yml"))
-    core_project = core_doc.get("name") or os.path.basename(core)
     reader = service(core_doc, READER_SERVICE)
     if not check(bool(reader), f"a {READER_SERVICE!r} service exists in the core compose"):
         return 1
-    # the title override (docker-compose.title.yml) sets the reader's env on top
-    # of the core's compose file
     title_doc = load(yaml, os.path.join(ROOT, "docker-compose.title.yml"))
-    r_env = expand_default(env_of(service(title_doc, READER_SERVICE)).get("POL_FFXI_IDMAP")
-                           or env_of(reader).get("POL_FFXI_IDMAP"))
-    r_rel = release_default(core)
-    r_lit = title_default()
-    print(f"  reader {READER_SERVICE}: compose env {r_env!r}, srvcore RELEASE_DEFAULTS "
-          f"{r_rel!r}, ffxititle.py literal {r_lit!r}")
-    if not check(r_lit is not None,
-                 "the literal default is still findable in lsb/ffxititle.py (this check reads it)"):
-        return 1
-    # The ladder the core applies: an env var set on the service wins, else the
-    # release default srvcore puts into os.environ at import, else the literal.
-    r_path, r_from = ((r_env, "the compose environment") if r_env else
-                      (r_rel, "srvcore RELEASE_DEFAULTS") if r_rel else
-                      (r_lit, "the ffxititle.py literal"))
-    r_host = resolve(r_path, mounts_of(reader, core_doc, core_project))
-    print(f"  reader {READER_SERVICE}: POL_FFXI_IDMAP={r_path} (from {r_from}) -> {r_host}")
-    # PINNED IN THE RELEASE, NOT LEFT TO A SOURCE LITERAL. The literal being
-    # right on one stack and wrong on another is what hid this for days.
-    check(bool(r_env or r_rel),
-          "POL_FFXI_IDMAP is pinned (compose env or RELEASE_DEFAULTS), not left "
-          "to the ffxititle.py literal")
-    check(r_host is not None,
-          f"the reader's path {r_path} is inside a mount of {READER_SERVICE} "
-          "(otherwise it can only ever read nothing)")
-    check(r_host is not None and r_host == w_host,
-          f"reader and writer resolve to the SAME volume file ({r_host!r} vs {w_host!r})")
+    r_url = expand_default(env_of(service(title_doc, READER_SERVICE)).get("POL_DATABASE_URL")
+                           or env_of(reader).get("POL_DATABASE_URL"))
+    print(f"  reader {READER_SERVICE}: POL_DATABASE_URL={r_url or None}")
+    check(bool(r_url), "the core's login service sets POL_DATABASE_URL")
+    check(bool(w_url) and w_url == r_url,
+          f"reader and writer use the SAME database ({r_url!r} vs {w_url!r})")
+    host = url_host(w_url)
+    check(host is not None and bool(service(core_doc, host)),
+          f"the database host {host!r} is a service of the core's compose project")
+
+    # --- the bridge waits for that database -------------------------------
+    deps = writer.get("depends_on") or {}
+    cond = (deps.get(host) or {}).get("condition") if isinstance(deps, dict) else None
+    check(cond == "service_healthy",
+          f"the bridge starts after {host!r} is healthy (depends_on: {cond!r})")
+
+    # --- one table name on both sides --------------------------------------
+    migrations = "".join(read_source("lsb", "ffxi_migrations", fn)
+                         for fn in sorted(os.listdir(ffxidb.MIGRATIONS_DIR))
+                         if fn.endswith(".sql"))
+    check(re.search(r"CREATE TABLE\s+%s\s*\(" % re.escape(ffxidb.IDMAP_TABLE), migrations)
+          is not None,
+          f"the bridge's migrations create table {ffxidb.IDMAP_TABLE}")
+    title_src = read_source("lsb", "ffxititle.py")
+    check(re.search(r"^IDMAP\s*=\s*ffxidb\.IDMAP_TABLE\s*$", title_src, re.M) is not None,
+          "the title plugin reads the table ffxidb names (ffxititle.IDMAP)")
+    bridge_src = read_source("lsb", "ffxi_bridge.py")
+    check("ffxidb.write_idmap(" in bridge_src and "ffxidb.load_idmap()" in bridge_src,
+          "the bridge writes and reads the map through ffxidb")
+
+    # --- the core's session table, which says who is launching ------------
+    # Not the id map, but the same failure shape: a key the core writes under
+    # one name and the bridge reads under another leaves every launch
+    # unattributed, and the bridge then refuses them all.
+    sess_src = os.path.join(core, "services", "core", "lobbysession.py")
+    core_key = None
+    if os.path.isfile(sess_src):
+        with open(sess_src, encoding="utf-8") as fh:
+            m = re.search(r'^_SESSION_KEY\s*=\s*"([^"]+)"', fh.read(), re.M)
+        core_key = m.group(1) if m else None
+    m = re.search(r'^AUTH_SESSION_KEY\s*=\s*"([^"]+)"', bridge_src, re.M)
+    bridge_key = m.group(1) if m else None
+    print(f"  session table: core writes {core_key!r}, bridge reads {bridge_key!r}")
+    check(core_key is not None and core_key == bridge_key,
+          "the bridge reads the core's session table under the key the core writes")
 
     # --- the port the search server needs ---------------------------------
     holders = sorted(name for name, svc in (core_doc.get("services") or {}).items()

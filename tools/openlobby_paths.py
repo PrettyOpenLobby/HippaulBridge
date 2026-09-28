@@ -11,6 +11,9 @@ Lookup order:
   3. ../openlobby        -- a checkout beside this repository
 
 A skip is exit status 77, which tools/bridge_run_all.py reports as `skip`.
+
+Suites that need a database call `require_database`, which takes one from the
+core's tools/pgtest.py.
 """
 import os
 import sys
@@ -60,3 +63,33 @@ def require_root(what):
     if r is None:
         skip(what, "an OpenLobby checkout (its docker-compose.yml and services/)")
     return r
+
+
+def require_database(what):
+    """Point this process (and every process it starts) at a new, empty
+    PostgreSQL database, dropped when the suite exits; returns its URL.
+
+    The database comes from the core's tools/pgtest.py: a throwaway postgres
+    container, or a database on POL_TEST_DATABASE_URL's server (which
+    bridge_run_all.py starts once and hands every suite). With neither the
+    suite SKIPS, and POL_TEST_REQUIRE_DB=1 (CI) turns that into a failure.
+    A POL_DATABASE_URL already in the environment is never used: it could be
+    a real stack's.
+    """
+    require_services(what)
+    r = root_dir()
+    tools = os.path.join(r, "tools") if r else None
+    if not tools or not os.path.isfile(os.path.join(tools, "pgtest.py")):
+        skip(what, "the OpenLobby core's tools/pgtest.py")
+    if tools not in sys.path:
+        sys.path.append(tools)
+    import pgtest
+    os.environ.pop("POL_DATABASE_URL", None)
+    try:
+        pgtest.server_url()
+    except Exception as exc:                    # noqa: BLE001 -- say why
+        if os.environ.get("POL_TEST_REQUIRE_DB") == "1":
+            print(f"FAIL: {what}: no PostgreSQL ({exc}) and POL_TEST_REQUIRE_DB=1")
+            sys.exit(1)
+        skip(what, f"PostgreSQL (Docker or POL_TEST_DATABASE_URL; {exc})")
+    return pgtest.use_fresh_database()

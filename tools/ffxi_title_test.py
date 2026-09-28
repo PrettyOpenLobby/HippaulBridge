@@ -4,24 +4,23 @@
     python tools/ffxi_title_test.py
 
 Needs the OpenLobby core checked out beside this repository (or OPENLOBBY_DIR
-pointing at it) for `titles.py`. Offline; writes an id map in a temp directory.
+pointing at it) for `titles.py` and its tools/pgtest.py: the id map is a table
+in a fresh PostgreSQL database the suite gets from there.
 """
-import json
 import os
 import sys
-import tempfile
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OPENLOBBY = os.environ.get("OPENLOBBY_DIR", os.path.join(ROOT, os.pardir, "openlobby"))
-sys.path.insert(0, os.path.join(OPENLOBBY, "services"))
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+from openlobby_paths import require_database  # noqa: E402
+require_database("ffxi_title_test")
 sys.path.insert(0, os.path.join(ROOT, "lsb"))
-
-TMP = tempfile.mkdtemp(prefix="ffxi-title-")
-IDMAP = os.path.join(TMP, "ffxi_idmap.json")
-os.environ["POL_FFXI_IDMAP"] = IDMAP
 
 import titles          # noqa: E402
 import ffxititle       # noqa: E402
+import ffxidb          # noqa: E402
+from polcore import db  # noqa: E402
 
 CTID = 30000101
 CHARID = 0x040506
@@ -35,10 +34,14 @@ def check(ok, label, detail=""):
 
 
 def write_map(entries):
-    with open(IDMAP, "w", encoding="utf-8") as fh:
-        json.dump(entries, fh)
-    # a fresh mtime is what tells the plugin to re-read; keep it moving
-    ffxititle._cache.update(mtime=None, map={}, prof={})
+    """Replace the bridge's map with `{charid: row}`. The plugin's cache is
+    left alone on purpose: the change counter the write moves is what must
+    tell it to re-read."""
+    ffxidb.write_idmap([dict(charid=int(k), content_id=v["content_id"],
+                             name=v.get("name", ""),
+                             world_field=v.get("world_field", 0),
+                             profile=v.get("profile"), seen="2026-09-28T00:00:00Z")
+                        for k, v in entries.items()], replace=True)
 
 
 def main():
@@ -46,9 +49,9 @@ def main():
     check(titles.for_code(1) is t, "registers as content code 1")
 
     print("\nno id map yet ->")
-    if os.path.exists(IDMAP):
-        os.remove(IDMAP)
-    ffxititle._cache.update(mtime=None, map={}, prof={})
+    ffxititle._cache.update(rev=None, map={}, prof={})
+    check(ffxidb.idmap_rev() is None,
+          "a database the bridge never ran on has no map table")
     check(titles.character_world(1, CTID) is None,
           "no map: no world identity (the core then serves 0)")
     check(titles.profile_fields(1, CTID, 7) == {},
@@ -83,12 +86,12 @@ def main():
           "another content code is not this title's")
 
     print("\nan unreadable map ->")
-    with open(IDMAP, "w", encoding="utf-8") as fh:
-        fh.write("{not json")
-    os.utime(IDMAP, None)
-    ffxititle._cache["mtime"] = None
+    # The counter says the map moved, and then the map cannot be read.
+    db.execute("UPDATE ffxi_idmap_rev SET rev = rev + 1")
+    db.execute("ALTER TABLE ffxi_idmap RENAME TO ffxi_idmap_away")
     check(titles.character_world(1, CTID) == want,
           "keeps the previous map rather than serving nothing")
+    db.execute("ALTER TABLE ffxi_idmap_away RENAME TO ffxi_idmap")
 
     print()
     if FAILS:
