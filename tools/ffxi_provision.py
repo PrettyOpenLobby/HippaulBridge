@@ -13,9 +13,10 @@ which is 0 for the first member of every POL ID); that is fixed separately.
     python tools/ffxi_provision.py rehome <charid> <member_id>
 
 `create` goes through LSB's own AUTH (`login_cmd::LOGIN_CREATE = 0x20`) so the
-password is bcrypted by LSB, never by us, and records the credential in the
-bridge's account map -- the password is generated once and cannot be recovered
-afterwards, so a lost map means orphaned accounts.
+password is bcrypted by LSB, never by us, and records the account in the
+bridge's account map (the ffxi_lsb_account table). The password is derived
+from FFXI_ACCT_SECRET, never stored, so a lost map entry is recorded again on
+the member's next launch.
 
 `rehome` moves an existing character onto a member's account. It exists for
 characters created before per-member accounts existed, on the shared account.
@@ -26,7 +27,8 @@ image, so mount them for the one command):
     docker compose run --rm --entrypoint python \
         -v "$PWD/tools:/app/tools:ro" bridge tools/ffxi_provision.py list
 
-or from the host with LSB_HOST/LSB_AUTH_PORT pointed at a published AUTH port.
+or from the host with LSB_HOST/LSB_AUTH_PORT pointed at a published AUTH port
+and POL_DATABASE_URL at the core's PostgreSQL.
 """
 import json
 import os
@@ -42,19 +44,18 @@ import ffxi_bridge as B  # noqa: E402
 
 
 def _members():
-    """POL members with an FFXI Content ID, from accounts.db."""
-    import sqlite3
-    db = sqlite3.connect(B.ACCOUNTS_DB, timeout=5.0)
-    db.row_factory = sqlite3.Row
+    """Every POL member's handles and FFXI Content IDs, from the core's
+    account database (POL_DATABASE_URL). A handle with no FFXI id is listed
+    with none."""
+    conn = B.ffxidb.accounts().connect()
     try:
-        db.execute("PRAGMA query_only = 1")
-        return db.execute(
+        return conn.execute(
             "SELECT m.id AS member_id, m.login_name, h.handle_name, hc.content_id "
             "FROM member m JOIN handle h ON h.member_id = m.id "
             "LEFT JOIN handle_content hc ON hc.handle_id = h.id AND hc.content_code = 1 "
             "ORDER BY m.id").fetchall()
     finally:
-        db.close()
+        conn.close()
 
 
 def cmd_list():
@@ -106,12 +107,25 @@ def cmd_selftest():
     Viewers are indistinguishable, proceed but block character CREATION, because
     a select is protected by POL's own character-table check and a create is not.
     """
-    import tempfile
     import time as _t
     now = _t.time()
-    path = os.path.join(tempfile.mkdtemp(), "auth-sessions.json")
-    B.POL_SESSIONS = path
+    try:
+        store = B.ffxidb.kv()
+    except ImportError as exc:
+        print(f"SKIP: the selftest needs the OpenLobby core's polcore.kv ({exc}). "
+              f"Set OPENLOBBY_DIR to a checkout of the core, or place one beside "
+              f"this repository as ../openlobby.")
+        return 77
+    os.environ.pop("POL_VALKEY_URL", None)   # never a real stack's live state
+    KV = store.MemoryKV()
+    store.reset(KV)
     fails = []
+
+    def write_sessions(sessions):
+        """The core's session table as its auth service writes it."""
+        KV.flush()
+        for sid, ent in sessions.items():
+            KV.set(B.AUTH_SESSION_KEY + sid, json.dumps(ent))
 
     def check(name, got, want):
         ok = got == want
@@ -121,8 +135,7 @@ def cmd_selftest():
             fails.append(name)
 
     def scenario(label, sessions):
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(sessions, fh)
+        write_sessions(sessions)
         B._claimed_sids.clear()
         print(f"  -- {label} --")
         return B.resolve_pol_member("172.18.0.1")
@@ -200,11 +213,10 @@ def cmd_selftest():
     import hashlib
     token = b"abcdefghijklmnopqrstuvwxyz012345"
     sid = "u" + hashlib.sha1(token).hexdigest()[:16]
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump({sid: {"member_id": 5, "peer_ip": "172.18.0.1", "at": now - 900,
-                         "viewer_open": True},
-                   "uOTHER": {"member_id": 7, "peer_ip": "172.18.0.1",
-                              "at": now - 1, "viewer_open": True}}, fh)
+    write_sessions({sid: {"member_id": 5, "peer_ip": "172.18.0.1", "at": now - 900,
+                          "viewer_open": True},
+                    "uOTHER": {"member_id": 7, "peer_ip": "172.18.0.1",
+                               "at": now - 1, "viewer_open": True}})
     # The packet the shim would send: magic + the first 8 bytes of the digest.
     pkt = bytearray(40)
     pkt[0] = 40

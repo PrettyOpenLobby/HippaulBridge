@@ -16,14 +16,14 @@ tool is the admin, reviewable path, and both share lsb/ffxi_import_core.py.)
            < import.sql
        # the last SELECT prints the allocated charid
 
-    2. # inside the bridge container, which mounts both state files at /data
+    2. # inside the bridge container, which has the stack's database
        # (the tools are not baked into the image, so mount them for the call):
        docker compose run --rm --entrypoint python \
            -v "$PWD/tools:/app/tools:ro" bridge \
            tools/ffxi_import.py bind <charid> --member 5 --name <Charname>
        docker compose restart bridge
        # bind records the POL Content ID <-> LSB charid pairing in the bridge's
-       # idmap (the restart makes the running bridge re-read it; do this while
+       # id map (the restart makes the running bridge re-read it; do this while
        # nobody is mid-launch). The world_field half is recorded automatically
        # by the bridge the first time the player fetches their character list.
 
@@ -189,22 +189,20 @@ def cmd_sql(args):
 
 def cmd_bind(args):
     import ffxi_bridge as B
-    B.load_idmap()
-    # The member's FFXI Content ID, from accounts.db (content_code 1 = FFXI).
-    import sqlite3
-    db = sqlite3.connect(B.ACCOUNTS_DB, timeout=5.0)
+    if not B.load_idmap():
+        raise SystemExit("cannot read the bridge's id map; is POL_DATABASE_URL "
+                         "the stack's database?")
+    # The member's FFXI Content ID (content_code 1 = FFXI), from the core's
+    # accounts: slot 0 of the primary handle, whatever its status.
+    A = B.ffxidb.accounts()
+    conn = A.connect()
     try:
-        db.execute("PRAGMA query_only = 1")
-        row = db.execute(
-            "SELECT hc.content_id FROM member m "
-            "JOIN handle h ON h.member_id = m.id "
-            "JOIN handle_content hc ON hc.handle_id = h.id AND hc.content_code = 1 "
-            "WHERE m.id = ?", (args.member,)).fetchone()
+        cid = A.member_content_id(conn, args.member, 1, active_only=False)
     finally:
-        db.close()
-    if not row:
-        raise SystemExit(f"member {args.member} has no FFXI Content ID in accounts.db")
-    content_id = int(row[0])
+        conn.close()
+    if not cid:
+        raise SystemExit(f"member {args.member} has no FFXI Content ID")
+    content_id = int(cid)
     key = str(args.charid)
     for k, v in B._idmap.items():
         if v == content_id and k != key:
@@ -217,9 +215,9 @@ def cmd_bind(args):
     B._idmap[key] = content_id
     if args.name:
         B._charnames[key] = args.name
-    B.save_idmap()
+    B.save_idmap(key)
     print(f"bound charid {args.charid} ({args.name or '?'}) -> Content ID "
-          f"{content_id} (member {args.member}) in {B.IDMAP_FILE}")
+          f"{content_id} (member {args.member}) in {B.IDMAP_WHERE}")
     print("world_field will be recorded by the bridge on the player's first "
           "character-list fetch; have them sign into POL AFTER this step.")
 
@@ -238,9 +236,9 @@ def main():
     ps.add_argument("--out")
     ps.set_defaults(fn=cmd_sql)
     pb = sub.add_parser("bind", help="record the Content ID pairing in the "
-                                     "bridge idmap (run where FFXI_IDMAP_FILE "
-                                     "and POL_ACCOUNTS_DB point at the live "
-                                     "files, then restart bridge)")
+                                     "bridge's id map (run where "
+                                     "POL_DATABASE_URL is the stack's "
+                                     "database, then restart bridge)")
     pb.add_argument("charid", type=int)
     pb.add_argument("--member", type=int, required=True)
     pb.add_argument("--name", help="the character's name, for the idmap record")
