@@ -10,6 +10,11 @@ core builds two things per Content ID that only the bridge knows:
 - the content profile's tail (world name, nation, zone, job, job level, race),
   which the bridge copies straight off LSB's own char-list record.
 
+While a member is in the world, it also tells the core which character they
+are playing, for the friend-status record their friends are sent
+(`presence_character`, from the bridge's in-world feed; off unless
+POL_FFXI_INGAME_PUSH=1).
+
 It also carries FFXI's one rule about the account database: FFXI issues one
 Content ID per CHARACTER, so a handle holding FFXI is given CHARACTER_SLOTS of
 them (`content_slots`, which the core's accounts module reads), and the
@@ -67,12 +72,41 @@ WORLD_ID = int(os.environ.get("POL_FFXI_WORLD_ID", "0x20"), 0)
 #: explanation. `trim-slots` cleans that up.
 CHARACTER_SLOTS = max(1, int(os.environ.get("POL_FFXI_CHARACTER_SLOTS") or 1))
 
+#: WHICH CHARACTER A FRIEND IS PLAYING. The bridge polls LSB's
+#: `accounts_sessions` and publishes `{member: {content_id, world_field, ...}}`
+#: under this live-state key (ffxi_bridge.ingame_loop, INGAME_KEY there). The
+#: core puts it in the friend-status record's `0x08` field, the one the core
+#: sizes at 0x10 without a name. LandSandBoat's xi_profile (PR #11639,
+#: `friendStatusNotice`) names it: flag 0x08 = sqPolCharacterPrimitive,
+#: `u16 valid | u16 content class | u32 sub id | u64 user id`, with +0x12 bit 0
+#: meaning "playing". Their sub id is `characterKey(charid)`, which is the same
+#: packing as our 1:3 world field. Their user id is the charid because
+#: xiloader's Content ID IS the charid; ours is the POL Content ID the 1:3 table
+#: carries at +0x10.
+#:
+#: WARNING: OFF BY DEFAULT: nobody has seen a Viewer draw it yet. Turn it on
+#: with POL_FFXI_INGAME_PUSH=1 and watch a friend's row while they log in to
+#: FFXI.
+INGAME_KEY = "ffxi:ingame"
+INGAME_PUSH = os.environ.get("POL_FFXI_INGAME_PUSH", "0") == "1"
+
 _cache = {"rev": None, "map": {}, "prof": {}}
 _missing_warned = set()
 
 
 def _log(text):
     titles.core.log("lobby", text)
+
+
+def ingame():
+    """The bridge's in-world map, `{str(member): {...}}`; {} when there is none
+    (no bridge, nobody in the world, or the store cannot be read)."""
+    try:
+        got = ffxidb.kv().get_json(INGAME_KEY) or {}
+    except Exception as exc:
+        _log(f"FFXI in-world map unreadable ({exc!r})")
+        return {}
+    return got if isinstance(got, dict) else {}
 
 
 def derive_world_field(charid, world_id=WORLD_ID):
@@ -188,6 +222,26 @@ class FinalFantasyXI(titles.Title):
             return world_fields().get(int(cid))
         except (TypeError, ValueError):
             return None
+
+    def presence_character(self, member_id):
+        # Only asked while the member's own 4:5 says FFXI, so the character
+        # and the zone the rest of the row shows can never disagree on screen;
+        # LSB drops the row some seconds after a disconnect.
+        if not INGAME_PUSH:
+            return None
+        try:
+            row = ingame().get(str(int(member_id)))
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(row, dict) or not row.get("content_id"):
+            return None
+        return int(row.get("world_field") or 0), int(row["content_id"])
+
+    def playing_characters(self):
+        if not INGAME_PUSH:
+            return {}
+        return {int(m): row.get("content_id") for m, row in ingame().items()
+                if str(m).isdigit() and isinstance(row, dict)}
 
     def profile_fields(self, cid, member_id):
         # STRAIGHT OFF LSB'S OWN CHAR-LIST RECORD, via the bridge. prof_001's

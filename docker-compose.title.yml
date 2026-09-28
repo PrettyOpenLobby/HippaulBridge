@@ -45,3 +45,6 @@ services:
       POL_TITLES: "${POL_TITLES:-ffxititle}"
       POL_FFXI_WORLD_ID: "${POL_FFXI_WORLD_ID:-0x20}"
       POL_FFXI_CHARACTER_SLOTS: "${POL_FFXI_CHARACTER_SLOTS:-}"
+      # 1: a friend's row says which FFXI character they are playing, from
+      # the bridge's in-world feed. Off by default (see the README).
+      POL_FFXI_INGAME_PUSH: "${POL_FFXI_INGAME_PUSH:-}"
