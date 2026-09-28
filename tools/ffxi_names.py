@@ -9,145 +9,107 @@ because the two halves of the chain live in different databases and neither know
 the other exists:
 
     FFXI character name   ->  Content ID   ->  handle
-    \\__ LandSandBoat (xidb) __/                \\__ accounts.db __/
+    \\__ LandSandBoat (xidb) __/                \\__ POL accounts __/
                           \\____ nobody ____/
 
-`accounts.db` knows `handle_content(handle_id, content_code, content_id)` -- which
-handle owns Content ID `1000000001` -- but has never been told that the FFXI
-character on it is called "Alice". LandSandBoat knows the character but nothing
-about PlayOnline. **The bridge is the only place both are ever seen together**, so
-it records the pairing in its id map (`ffxi_idmap.json`, `FFXI_IDMAP_FILE`) as
-it watches the lobby:
+The POL account database knows `handle_content(handle_id, content_code,
+content_id)` -- which handle owns Content ID `1000000001` -- but has never been
+told that the FFXI character on it is called "Alice". LandSandBoat knows the
+character but nothing about PlayOnline. **The bridge is the only place both are
+ever seen together**, so it records the pairing in its id map (the `ffxi_idmap`
+table) as it watches the lobby: charid 1, Content ID 1000000001, name "Alice".
 
-    {"1": {"content_id": 1000000001, "name": "Alice", "seen": "..."}}
-
-This tool imports that into `accounts.db` as `content_character`, which is the
-POL-side answer to "who is Alice?" -- and, read the other way, "what is this
-handle's FFXI character called?".
-
-DELIBERATELY STANDALONE. It creates its own table and does not touch
-`accounts.py` or `responders.py`, so it can land while other work is in flight in
-those files. The serving side (member search, friend-add resolution, the Content
-ID list UI) is a separate, later step -- this only establishes the data.
+This tool copies the named rows of that map into the core's `content_character`
+table through `accounts.record_character_name`, which is the POL-side answer to
+"who is Alice?" -- and, read the other way, "what is this handle's FFXI
+character called?". The table is part of the core's schema; the core's
+`accounts.character_names` is its read side.
 
 USAGE
-    python tools/ffxi_names.py import [--map /data/ffxi_idmap.json] [--db /data/accounts.db]
+    python tools/ffxi_names.py import
     python tools/ffxi_names.py list
     python tools/ffxi_names.py lookup <character-name>
     python tools/ffxi_names.py whois <handle-name>
 
 `import` is idempotent: re-running it updates names and timestamps in place.
 
-The defaults are the paths inside the bridge container (POL_ACCOUNTS_DB and
-FFXI_IDMAP_FILE override them), so the usual invocation is:
+Every command uses the core's database, POL_DATABASE_URL (or `--db URL`), so
+the usual invocation is inside the bridge container:
 
     docker compose run --rm --entrypoint python \
         -v "$PWD/tools:/app/tools:ro" bridge tools/ffxi_names.py list
 """
 import argparse
-import json
 import os
-import sqlite3
 import sys
-import time
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_DB = os.environ.get("POL_ACCOUNTS_DB", "/data/accounts.db")
-DEFAULT_MAP = os.environ.get("FFXI_IDMAP_FILE", "/data/ffxi_idmap.json")
+# `lsb/` beside this tool in the repo, `/app` inside the bridge image.
+sys.path.insert(0, os.path.join(_HERE, os.pardir, "lsb"))
+sys.path.append("/app")
+import ffxidb  # noqa: E402
 
-#: One row per (world, character). `content_id` is the join back to
-#: `handle_content.content_id` -- TEXT there, so TEXT here too; a mismatched type
-#: would make every join silently miss.
-#:
-#: `world_charid` is LandSandBoat's `chars.charid`, kept because it is the key the
-#: world server actually uses and the only stable id if a character is renamed.
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS content_character (
-    content_id     TEXT NOT NULL,
-    content_code   INTEGER NOT NULL DEFAULT 1,
-    world_charid   INTEGER,
-    character_name TEXT NOT NULL,
-    world_name     TEXT,
-    first_seen     TEXT NOT NULL,
-    last_seen      TEXT NOT NULL,
-    PRIMARY KEY (content_id, content_code)
-);
-CREATE INDEX IF NOT EXISTS content_character_by_name
-    ON content_character (character_name);
-"""
+#: FFXI's content code.
+CONTENT_CODE = 1
 
 
-def connect(path):
-    if not os.path.exists(path):
-        sys.exit(f"no such database: {path}")
-    # A normal handle: accounts.db is WAL, and `mode=ro` cannot create the -shm
-    # index a WAL reader needs. Writers here are deliberate and small.
-    conn = sqlite3.connect(path, timeout=10.0)
-    conn.row_factory = sqlite3.Row
-    conn.executescript(SCHEMA)
-    conn.commit()
-    return conn
+def connect(url=None):
+    """A connection to the core's account database (POL_DATABASE_URL, or
+    `url` when it is a postgresql:// URL)."""
+    try:
+        return ffxidb.accounts().connect(url)
+    except Exception as exc:
+        sys.exit(f"cannot open the account database: {exc}")
 
 
-def load_map(path):
-    """Read the bridge's map, accepting both on-disk shapes.
+def load_map():
+    """The bridge's named characters: [(content_id, charid, name, world)].
 
-    The original was a flat `{"<charid>": <ContentID>}` with no name in it; those
-    entries are skipped rather than imported as blanks, so an old file produces
-    "nothing to import" instead of a table full of empty names.
+    Rows the bridge has not learned a name for yet are skipped rather than
+    imported as blanks, so a fresh map produces "nothing to import" instead of
+    a table full of empty names.
     """
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            raw = json.load(fh)
-    except FileNotFoundError:
-        sys.exit(f"no bridge map at {path} -- has the bridge seen a character list yet?")
+        rows = ffxidb.load_idmap()
+    except Exception as exc:
+        sys.exit(f"cannot read the bridge's id map ({exc}) -- has the bridge "
+                 f"run against this database yet?")
     out = []
-    for charid, v in raw.items():
-        if not isinstance(v, dict):
-            continue                    # old flat entry: Content ID only, no name
-        name = (v.get("name") or "").strip()
+    for r in rows:
+        name = (r.get("name") or "").strip()
         if not name:
             continue
-        out.append((str(v["content_id"]), int(charid), name, v.get("world") or None))
+        out.append((str(r["content_id"]), int(r["charid"]), name, None))
     return out
 
 
 def cmd_import(args):
-    entries = load_map(args.map)
+    conn = connect(args.db)
+    entries = load_map()
     if not entries:
-        print(f"{args.map}: no named characters yet -- nothing to import.")
+        print(f"table {ffxidb.IDMAP_TABLE}: no named characters yet -- nothing "
+              f"to import.")
         print("The bridge fills the name in when it relays a character list or a")
         print("world handoff, so launch FFXI once and re-run this.")
+        conn.close()
         return 0
-    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    conn = connect(args.db)
+    A = ffxidb.accounts()
     added = updated = 0
     try:
         for content_id, charid, name, world in entries:
-            row = conn.execute(
-                "SELECT character_name FROM content_character "
-                "WHERE content_id = ? AND content_code = 1", (content_id,)).fetchone()
-            if row is None:
-                conn.execute(
-                    "INSERT INTO content_character (content_id, content_code, "
-                    "world_charid, character_name, world_name, first_seen, last_seen) "
-                    "VALUES (?, 1, ?, ?, ?, ?, ?)",
-                    (content_id, charid, name, world, now, now))
+            outcome, old = A.record_character_name(
+                conn, content_id, name, content_code=CONTENT_CODE,
+                world_charid=charid, world_name=world)
+            if outcome == "added":
                 added += 1
             else:
-                conn.execute(
-                    "UPDATE content_character SET world_charid = ?, character_name = ?, "
-                    "world_name = COALESCE(?, world_name), last_seen = ? "
-                    "WHERE content_id = ? AND content_code = 1",
-                    (charid, name, world, now, content_id))
-                if row["character_name"] != name:
-                    print(f"  renamed: {row['character_name']!r} -> {name!r} "
-                          f"on Content ID {content_id}")
+                if outcome == "renamed":
+                    print(f"  renamed: {old!r} -> {name!r} on Content ID {content_id}")
                 updated += 1
-        conn.commit()
     finally:
         conn.close()
-    print(f"imported {added} new, refreshed {updated} (from {args.map})")
+    print(f"imported {added} new, refreshed {updated} "
+          f"(from table {ffxidb.IDMAP_TABLE})")
     return 0
 
 
@@ -194,7 +156,7 @@ def cmd_lookup(args):
     try:
         # Case-insensitive: FFXI capitalises names, POL does not care, and a
         # lookup that only matched exact case would fail on user input.
-        _print(_joined(conn, "WHERE UPPER(cc.character_name) = UPPER(?)", (args.name,)))
+        _print(_joined(conn, "WHERE UPPER(cc.character_name) = UPPER(%s)", (args.name,)))
     finally:
         conn.close()
     return 0
@@ -203,7 +165,7 @@ def cmd_lookup(args):
 def cmd_whois(args):
     conn = connect(args.db)
     try:
-        _print(_joined(conn, "WHERE UPPER(h.handle_name) = UPPER(?)", (args.handle,)))
+        _print(_joined(conn, "WHERE UPPER(h.handle_name) = UPPER(%s)", (args.handle,)))
     finally:
         conn.close()
     return 0
@@ -211,10 +173,11 @@ def cmd_whois(args):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--db", default=DEFAULT_DB)
+    ap.add_argument("--db", default=None,
+                    help="a postgresql:// URL (default POL_DATABASE_URL)")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("import", help="import the bridge's map into accounts.db")
-    p.add_argument("--map", default=DEFAULT_MAP)
+    p = sub.add_parser("import", help="copy the bridge's character names into "
+                                      "the core's content_character")
     p.set_defaults(fn=cmd_import)
     sub.add_parser("list", help="every known character and its handle").set_defaults(fn=cmd_list)
     p = sub.add_parser("lookup", help="character name -> handle")
