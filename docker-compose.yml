@@ -1,11 +1,23 @@
 # CrystalBridge: a LandSandBoat (FFXI) world server plus the bridge that lets a
-# PlayOnline Viewer's FFXI launch land in it. One command brings up everything:
+# PlayOnline Viewer's FFXI launch land in it. This file is an OVERRIDE of
+# OpenLobby's compose file, not a stack of its own: everything here runs in
+# OpenLobby's compose project, beside the core, on its network, and the bridge
+# keeps its state in the core's PostgreSQL. With both repositories checked out
+# side by side, from this directory:
 #
 #   cp .env.example .env      # set LSB_ADVERTISE_IP and the passwords
-#   docker compose up -d --build
+#   docker compose --project-directory ../openlobby \
+#       --env-file ../openlobby/.env --env-file .env \
+#       -f ../openlobby/docker-compose.yml -f docker-compose.yml \
+#       up -d --build db db-update db-zoneip connect search world map bridge
 #
-# Prerequisites (README.md): the OpenLobby core stack running on this host
-# (its data volume is `openlobby_pol-data`) and the two LSB mesh volumes
+# (OpenLobby's .env first, so its POL_DB_PASSWORD reaches the connection
+# string below; this repository's .env second, for the LSB_* and FFXI_* knobs.)
+# Relative paths resolve against ../openlobby, the project directory.
+#
+# Prerequisites (README.md): the OpenLobby core image built (openlobby:latest,
+# `docker compose build` in ../openlobby) or OPENLOBBY_IMAGE pointed at the one
+# you use, since the bridge image is built on it; and the two LSB mesh volumes
 # populated once.
 #
 # CONFIG. The LSB image reads XI_{FILE}_{SETTING} env vars over its
@@ -181,9 +193,12 @@ services:
   # the ports the client actually dials.
   bridge:
     build:
-      context: ./lsb
+      context: ../crystalbridge/lsb
       dockerfile: Dockerfile.bridge
+      args:
+        OPENLOBBY_IMAGE: "${OPENLOBBY_IMAGE:-openlobby:latest}"
     image: crystalbridge:latest
+    pull_policy: build
     environment:
       LSB_HOST: connect
       LSB_VIEW_PORT: "54001"
@@ -199,15 +214,15 @@ services:
       # zones advertise, for the same reason (127.0.0.1 is wrong for any real
       # client).
       SEARCH_IP: "${LSB_ADVERTISE_IP:-127.0.0.1}"
-      # The core stack's data volume: accounts.db (which members hold which FFXI
-      # Content IDs) and auth-sessions.json (which member is signed in from
-      # where). The Content ID map is written HERE too, because the core's login
-      # service must read it back (its POL_FFXI_IDMAP defaults to this path).
-      POL_ACCOUNTS_DB: /data/accounts.db
-      POL_AUTH_SESSIONS: /data/auth-sessions.json
-      FFXI_IDMAP_FILE: /data/ffxi_idmap.json
-      # The bridge's own state: which LSB account each member has.
-      FFXI_ACCTMAP_FILE: /state/ffxi_accounts.json
+      # The core's PostgreSQL and Valkey (OpenLobby's docs/database.md). The
+      # accounts (which members hold which FFXI Content IDs) are read through
+      # the core's accounts module; the bridge's own state, the Content ID map
+      # the core's login service reads back and the member -> LSB account map,
+      # is in CrystalBridge's ffxi_* tables (lsb/ffxi_migrations/), which the
+      # bridge creates at start. Which member is signed in from where is the
+      # core's session table in Valkey.
+      POL_DATABASE_URL: "postgresql://openlobby:${POL_DB_PASSWORD:-openlobby}@postgres:5432/openlobby"
+      POL_VALKEY_URL: "valkey://valkey:6379/0"
       # Seed for the per-member LSB passwords (derived, never stored). Set it
       # once; changing it changes every member's LSB password.
       FFXI_ACCT_SECRET: "${FFXI_ACCT_SECRET:-change-me}"
@@ -265,8 +280,6 @@ services:
       - "54230:54230/udp"      # world channel, relayed to `map`
       - "54004:54004"          # character-import endpoint (BRIDGE_IMPORT_PORT)
     volumes:
-      - pol-data:/data
-      - bridge-state:/state
       - bridge-logs:/logs
     healthcheck:
       test: ["CMD", "python", "-c",
@@ -278,18 +291,20 @@ services:
     depends_on:
       connect:
         condition: service_started
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
 
+# These keep the names they had when this was a compose project of its own,
+# so the LSB database and the logs carry over.
 volumes:
   lsb-db:
+    name: crystalbridge_lsb-db
   lsb-logs:
-  bridge-state:
+    name: crystalbridge_lsb-logs
   bridge-logs:
-  # The OpenLobby core's data volume (its compose project is `openlobby`, its
-  # volume key `pol-data`). Shared, not copied: accounts.db and
-  # auth-sessions.json are read here, ffxi_idmap.json is written here.
-  pol-data:
-    external: true
-    name: openlobby_pol-data
+    name: crystalbridge_bridge-logs
   # Both pre-populated once from ghcr.io/landsandboat/ximeshes (that image ships
   # /navmeshes AND /ximeshes); see README.md. External so `down -v` never
   # destroys the ~570 MB of mesh data.
