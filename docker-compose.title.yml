@@ -1,0 +1,43 @@
+# The FFXI title plugin for the OpenLobby core. This file is an OVERRIDE of
+# OpenLobby's compose file, not a stack of its own: the plugin runs inside
+# the core's login and authsess processes, so it is applied on top of
+# OpenLobby's compose file, in OpenLobby's project. The bridge, LSB and its
+# database stay in this repository's own docker-compose.yml.
+#
+# With both repositories checked out side by side, from this directory:
+#
+#   docker compose --project-directory ../openlobby \
+#       -f ../openlobby/docker-compose.yml -f docker-compose.title.yml \
+#       up -d --build login authsess
+#
+# Without it the core still logs FFXI accounts in and lists their
+# characters, but serves them with no world identity, and the world connect
+# fails with POL-0001.
+#
+# Stacking titles: every title image is the core image plus one plugin, so
+# to run several, build each on the previous one (OPENLOBBY_IMAGE) and list
+# them all in POL_TITLES, e.g. POL_TITLES=tmtitle,ffxititle in .env.
+
+services:
+  login:
+    image: crystalbridge-title:latest
+    build:
+      context: ../crystalbridge/lsb
+      dockerfile: Dockerfile.title
+      args:
+        OPENLOBBY_IMAGE: "${OPENLOBBY_IMAGE:-openlobby:latest}"
+    pull_policy: build
+    environment:
+      POL_TITLES: "${POL_TITLES:-ffxititle}"
+      # where the bridge writes the id map (its FFXI_IDMAP_FILE), on the
+      # shared data volume both stacks mount at /data
+      POL_FFXI_IDMAP: "${POL_FFXI_IDMAP:-/data/ffxi_idmap.json}"
+      POL_FFXI_WORLD_ID: "${POL_FFXI_WORLD_ID:-0x20}"
+
+  authsess:
+    image: crystalbridge-title:latest
+    pull_policy: never
+    environment:
+      POL_TITLES: "${POL_TITLES:-ffxititle}"
+      POL_FFXI_IDMAP: "${POL_FFXI_IDMAP:-/data/ffxi_idmap.json}"
+      POL_FFXI_WORLD_ID: "${POL_FFXI_WORLD_ID:-0x20}"

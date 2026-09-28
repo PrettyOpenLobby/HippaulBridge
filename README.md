@@ -36,6 +36,23 @@ FFXI client and PlayOnline Viewer.
    `LSB_ADVERTISE_IP:54230`; the bridge relays that to LSB's map server
    unchanged, purely so the exchange is observable.
 
+## The title plugin (the Viewer's profile)
+
+The core builds the profile the Viewer shows for a FINAL FANTASY XI Content ID from
+data only this title holds, so a small plugin runs inside the core's `login`
+and `authsess` processes (OpenLobby's `services/titles.py`, `POL_TITLES`).
+`lsb/Dockerfile.title` layers it on the core image and `docker-compose.title.yml`
+swaps that image into those two services. From this directory, with the core
+checked out beside it:
+
+```
+docker compose --project-directory ../openlobby     -f ../openlobby/docker-compose.yml -f docker-compose.title.yml     up -d --build login authsess
+```
+
+Without it the core still logs FFXI accounts in and lists their characters, but serves them with no world identity, and the world connect fails with POL-0001; the plugin also fills the profile's world, nation, zone, job and race from the bridge's id map. To run several titles, build each title image on the previous
+one (`OPENLOBBY_IMAGE`) and list them all in `POL_TITLES` in OpenLobby's
+`.env`, for example `POL_TITLES=tmtitle,ffxititle`.
+
 ## Prerequisites
 
 - Docker with Compose v2

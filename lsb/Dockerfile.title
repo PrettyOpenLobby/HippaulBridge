@@ -1,0 +1,14 @@
+# The FFXI title plugin, layered on the OpenLobby core image.
+#
+# The bridge is its own service (Dockerfile.bridge). This image is the core
+# plus lsb/ffxititle.py, the part of FFXI that runs INSIDE the core's login
+# and authsess processes: it serves each character's world identity and the
+# profile tail out of the id map the bridge writes. docker-compose.title.yml
+# swaps it in for those two services. Build the core first, or point
+# OPENLOBBY_IMAGE at the image you use (a title image, to stack titles).
+ARG OPENLOBBY_IMAGE=openlobby:latest
+FROM ${OPENLOBBY_IMAGE}
+
+COPY ffxititle.py /app/ffxititle.py
+
+ENV POL_TITLES=ffxititle
