@@ -24,9 +24,9 @@
 
 services:
   login:
-    image: crystalbridge-title:latest
+    image: hippaulbridge-title:latest
     build:
-      context: ../crystalbridge/lsb
+      context: ../hippaulbridge/lsb
       dockerfile: Dockerfile.title
       args:
         OPENLOBBY_IMAGE: "${OPENLOBBY_IMAGE:-openlobby:latest}"
@@ -39,7 +39,7 @@ services:
       POL_FFXI_CHARACTER_SLOTS: "${POL_FFXI_CHARACTER_SLOTS:-}"
 
   authsess:
-    image: crystalbridge-title:latest
+    image: hippaulbridge-title:latest
     pull_policy: never
     environment:
       POL_TITLES: "${POL_TITLES:-ffxititle}"

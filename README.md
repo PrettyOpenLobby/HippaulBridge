@@ -1,4 +1,4 @@
-# CrystalBridge
+# HippaulBridge
 
 The bridge between the OpenLobby PlayOnline core and a LandSandBoat FINAL
 FANTASY XI world server. With both running, a player signs into an unmodified
@@ -56,6 +56,9 @@ one (`OPENLOBBY_IMAGE`) and list them all in `POL_TITLES` in OpenLobby's
 
 ## Prerequisites
 
+- This repository checked out as `hippaulbridge`, which is where the compose files
+  look for it (`git clone https://github.com/PrettyOpenLobby/HippaulBridge.git hippaulbridge`).
+  A checkout from before the rename, still named `crystalbridge`, needs renaming.
 - Docker with Compose v2
 - OpenLobby checked out beside this repository as `../openlobby`, with its
   image built (`docker compose build` there, which tags `openlobby:latest`).
@@ -104,7 +107,7 @@ database URL. The rest of this README writes `docker compose` for that whole
 invocation (the project directory, both env files and both compose files).
 
 Without building the bridge image (published to
-`ghcr.io/prettyopenlobby/crystalbridge` on every push), add
+`ghcr.io/prettyopenlobby/hippaulbridge` on every push), add
 `-f docker-compose.ghcr.yml` after the other two files.
 
 The first start imports LSB's schema (a minute or two; `db-update` runs

@@ -11,6 +11,6 @@
 
 services:
   bridge:
-    image: ghcr.io/prettyopenlobby/crystalbridge:${CRYSTALBRIDGE_TAG:-latest}
+    image: ghcr.io/prettyopenlobby/hippaulbridge:${HIPPAULBRIDGE_TAG:-${CRYSTALBRIDGE_TAG:-latest}}
     pull_policy: missing
     build: !reset null

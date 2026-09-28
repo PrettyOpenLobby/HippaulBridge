@@ -6,7 +6,7 @@ account each POL member has (`ffxi_lsb_account`). Both live in the database
 the OpenLobby core runs (POL_DATABASE_URL). Their schema is this repository's
 own migration set, `lsb/ffxi_migrations/`, applied with OpenLobby's runner
 (polcore.db.migrate). Versions 6001-6999 of the shared schema_migrations table
-belong to CrystalBridge.
+belong to HippaulBridge.
 
 The account database itself is OpenLobby's: the bridge reads it through the
 core's `accounts` module, never with its own SQL on the core's tables.
@@ -113,7 +113,7 @@ def migration_files():
     lo, hi = VERSION_RANGE
     bad = [name for version, name, _ in files if not lo <= version <= hi]
     if bad:
-        raise pg.MigrationError(f"{', '.join(bad)}: CrystalBridge's migrations "
+        raise pg.MigrationError(f"{', '.join(bad)}: HippaulBridge's migrations "
                                 f"are numbered {lo}-{hi}")
     return files
 
@@ -369,7 +369,7 @@ def import_file(store, path, merge=False, dry_run=False, out=print):
     kidx = lambda r: tuple(r[c] for c in key)          # noqa: E731
     result = {}
     try:
-        with pg.transaction(lock="crystalbridge.import:" + table) as conn:
+        with pg.transaction(lock="hippaulbridge.import:" + table) as conn:
             exists = conn.execute("SELECT to_regclass(%s) IS NOT NULL AS ok",
                                   (table,)).fetchone()["ok"]
             have = {}
@@ -464,7 +464,7 @@ def _main(argv):
         return _import_main(argv[1:])
     import argparse
     ap = argparse.ArgumentParser(prog="python ffxidb.py",
-                                 description="CrystalBridge's migrations "
+                                 description="HippaulBridge's migrations "
                                  "(uses POL_DATABASE_URL).")
     ap.add_argument("cmd", choices=("migrate", "status"))
     args = ap.parse_args(argv)
