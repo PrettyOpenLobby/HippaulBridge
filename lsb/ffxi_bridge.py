@@ -674,9 +674,10 @@ def content_id_for(charid, prefer=None, member_id=None):
                              f"created a character it has no free Content ID for; this "
                              f"one stays unpaired rather than corrupting charid {other}'s "
                              f"world identity. A handle holds "
-                             f"POL_FFXI_CHARACTER_SLOTS Content IDs, so seeing this "
-                             f"means the pool really is exhausted: raise that, or "
-                             f"delete one of the two characters.")
+                             f"POL_FFXI_CHARACTER_SLOTS Content IDs (the title "
+                             f"plugin's setting), so seeing this means the pool "
+                             f"really is exhausted: raise that, or delete one of "
+                             f"the two characters.")
                 return None
             _idmap[key] = int(prefer)
             _released_ids.pop(key, None)
@@ -697,8 +698,9 @@ def content_id_for(charid, prefer=None, member_id=None):
                          f"passing the charid through untranslated -- this "
                          f"character will draw POL-0001 at char select. POL now "
                          f"issues POL_FFXI_CHARACTER_SLOTS ids per handle "
-                         f"(accounts.ensure_ffxi_character_slots tops an existing "
-                         f"handle up); raise it, or delete a character to free one")
+                         f"(the title plugin's setting; an existing handle is "
+                         f"topped up at its next POL login); raise it, or delete "
+                         f"a character to free one")
             return None
         _idmap[key] = free[0]
         _released_ids.pop(key, None)

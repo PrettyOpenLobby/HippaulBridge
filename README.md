@@ -125,14 +125,29 @@ A PlayOnline account plays FFXI when its handle holds FFXI Content IDs
 - through in-client sign-up, if the registration code was issued with FFXI
   granted.
 
-Each grant mints `POL_FFXI_CHARACTER_SLOTS` Content IDs (OpenLobby's setting,
-default 1), one per character slot, because FFXI issues one Content ID per
-character. A handle can hold at most eight Content IDs across all titles, and
-OpenLobby never mints or serves a ninth: the Viewer refuses to open FFXI on a
-handle it thinks is over that limit. On a handle granted every title, one FFXI
-character is all there is room for; raise `POL_FFXI_CHARACTER_SLOTS` only for
-handles holding fewer titles. FFXI must also be listed in OpenLobby's `POL_LOBBY_CONTENT_IDS` for
-the Play button to appear; the default list includes it.
+A handle holding FFXI is given `POL_FFXI_CHARACTER_SLOTS` Content IDs
+(default 1), one per character slot, because FFXI issues one Content ID per
+character. The setting belongs to the title plugin (its `content_slots`), so it
+takes effect where the plugin is loaded: set it in OpenLobby's `.env` and
+`docker-compose.title.yml` passes it to `login` and `authsess`. The core mints
+the extra ids when a process that loads the plugin grants FFXI, and tops a
+member's handles up at each login, which covers accounts made by the sign-up
+page or the admin panel. A handle can hold at most eight Content IDs across
+all titles, and OpenLobby never mints or serves a ninth: the Viewer refuses to
+open FFXI on a handle it thinks is over that limit. On a handle granted every
+title, one FFXI character is all there is room for; raise the setting only for
+handles holding fewer titles. FFXI must also be listed in OpenLobby's
+`POL_LOBBY_CONTENT_IDS` for the Play button to appear; the default list
+includes it.
+
+A database that already went over the limit is cleaned up with the plugin's
+own command, which reports unless given `--apply` and never touches an id a
+character is on:
+
+```
+docker compose --project-directory ../openlobby -f ../openlobby/docker-compose.yml \
+    -f docker-compose.title.yml exec login python ffxititle.py /data/accounts.db trim-slots
+```
 
 The first launch does the rest: the bridge creates the member's LSB account
 (`pol<member id>`, password derived from `FFXI_ACCT_SECRET`, never stored),
@@ -225,8 +240,9 @@ CONF channel is the PlayOnline lobby, not LSB's.
   `/data/ffxi_idmap.json`; `tools/ffxi_idmap_check.py`; OpenLobby's lobby
   log says `FFXI id map ... DOES NOT EXIST`), or the member has no free
   Content ID for the character (the bridge log says `NO FREE FFXI Content
-  ID`). Delete a character, or raise `POL_FFXI_CHARACTER_SLOTS` in OpenLobby
-  if the handle has room under the eight-Content-ID limit.
+  ID`). Delete a character, or raise `POL_FFXI_CHARACTER_SLOTS` in
+  OpenLobby's `.env` if the handle has room under the eight-Content-ID limit
+  (the member picks the new ids up at the next POL login).
 - **FFXI-3100.** Nothing answered on 54001: the bridge is down, or DNS sent
   the client elsewhere. `docker compose logs bridge`.
 - **FFXI-3332 after "Acquiring Player Data".** LSB had no data session for
