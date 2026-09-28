@@ -6,7 +6,7 @@ No containers, no network: it reads this repository's docker-compose.yml (the
 WRITER: the `bridge` service's FFXI_IDMAP_FILE) and the OpenLobby core's
 docker-compose.yml plus its source defaults (the READER: the `login` service's
 POL_FFXI_IDMAP, falling back to services/srvcore.py's RELEASE_DEFAULTS and
-then to the literal in services/responders.py, which is the order the core
+then to the literal in lsb/ffxititle.py (the title plugin), which is the order the core
 applies them in), resolves each path through that service's own volume mounts
 to a Docker volume plus a path inside it, and compares them. It also checks
 that no core service publishes host port 54002, which LSB's search server
@@ -82,16 +82,23 @@ def read_source(root, *parts):
         return fh.read()
 
 
-def responders_default(root):
-    """`POL_FFXI_IDMAP`'s literal fallback in responders.py."""
-    m = re.search(r'_FFXI_IDMAP\s*=\s*os\.environ\.get\(\s*"POL_FFXI_IDMAP"\s*,\s*'
-                  r'"([^"]+)"\s*\)', read_source(root, "services", "responders.py"))
+def title_default():
+    """`POL_FFXI_IDMAP`'s literal fallback in the title plugin, lsb/ffxititle.py
+    (the reader runs inside the core's login process)."""
+    m = re.search(r'IDMAP\s*=\s*os\.environ\.get\(\s*"POL_FFXI_IDMAP"\s*,\s*'
+                  r'"([^"]+)"\s*\)', read_source(ROOT, "lsb", "ffxititle.py"))
     return m.group(1) if m else None
+
+
+def expand_default(value):
+    """`${VAR:-default}` as compose expands it with VAR unset."""
+    m = re.fullmatch(r"\$\{[A-Za-z_][A-Za-z0-9_]*:-([^}]*)\}", value or "")
+    return m.group(1) if m else value
 
 
 def release_default(root):
     """`POL_FFXI_IDMAP` in srvcore.py's RELEASE_DEFAULTS, applied with
-    os.environ.setdefault before responders reads the variable."""
+    os.environ.setdefault before the title plugin reads the variable."""
     src = read_source(root, "services", "srvcore.py")
     m = re.search(r"RELEASE_DEFAULTS\s*=\s*\{(.*?)\n\}", src, re.S)
     if not m:
@@ -200,26 +207,30 @@ def main():
     reader = service(core_doc, READER_SERVICE)
     if not check(bool(reader), f"a {READER_SERVICE!r} service exists in the core compose"):
         return 1
-    r_env = env_of(reader).get("POL_FFXI_IDMAP")
+    # the title override (docker-compose.title.yml) sets the reader's env on top
+    # of the core's compose file
+    title_doc = load(yaml, os.path.join(ROOT, "docker-compose.title.yml"))
+    r_env = expand_default(env_of(service(title_doc, READER_SERVICE)).get("POL_FFXI_IDMAP")
+                           or env_of(reader).get("POL_FFXI_IDMAP"))
     r_rel = release_default(core)
-    r_lit = responders_default(core)
+    r_lit = title_default()
     print(f"  reader {READER_SERVICE}: compose env {r_env!r}, srvcore RELEASE_DEFAULTS "
-          f"{r_rel!r}, responders.py literal {r_lit!r}")
+          f"{r_rel!r}, ffxititle.py literal {r_lit!r}")
     if not check(r_lit is not None,
-                 "the literal default is still findable in responders.py (this check reads it)"):
+                 "the literal default is still findable in lsb/ffxititle.py (this check reads it)"):
         return 1
     # The ladder the core applies: an env var set on the service wins, else the
     # release default srvcore puts into os.environ at import, else the literal.
     r_path, r_from = ((r_env, "the compose environment") if r_env else
                       (r_rel, "srvcore RELEASE_DEFAULTS") if r_rel else
-                      (r_lit, "the responders.py literal"))
+                      (r_lit, "the ffxititle.py literal"))
     r_host = resolve(r_path, mounts_of(reader, core_doc, core_project))
     print(f"  reader {READER_SERVICE}: POL_FFXI_IDMAP={r_path} (from {r_from}) -> {r_host}")
     # PINNED IN THE RELEASE, NOT LEFT TO A SOURCE LITERAL. The literal being
     # right on one stack and wrong on another is what hid this for days.
     check(bool(r_env or r_rel),
           "POL_FFXI_IDMAP is pinned (compose env or RELEASE_DEFAULTS), not left "
-          "to the responders.py literal")
+          "to the ffxititle.py literal")
     check(r_host is not None,
           f"the reader's path {r_path} is inside a mount of {READER_SERVICE} "
           "(otherwise it can only ever read nothing)")
