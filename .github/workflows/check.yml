@@ -14,10 +14,35 @@ jobs:
         run: python check.py
   selftests:
     runs-on: ubuntu-latest
+    # The bridge's maps and the account suites run against PostgreSQL through
+    # the core's accounts module and polcore, so the core is checked out
+    # beside this repository and a PostgreSQL service gives every suite its
+    # own database.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: pgtest
+          POSTGRES_INITDB_ARGS: "--locale=C -E UTF8"
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      POL_TEST_DATABASE_URL: postgresql://postgres:pgtest@127.0.0.1:5432/postgres
+      POL_TEST_REQUIRE_DB: "1"
+      OPENLOBBY_DIR: ${{ github.workspace }}/openlobby
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/openlobby
+          path: openlobby
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install pyyaml
+      - run: >-
+          pip install pyyaml pycryptodome pillow
+          "psycopg[binary]==3.3.6" "psycopg-pool==3.3.3" "valkey==6.1.1"
       - run: python tools/bridge_run_all.py

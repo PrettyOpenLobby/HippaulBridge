@@ -29,9 +29,10 @@ FFXI client and PlayOnline Viewer.
    would client-side.
 4. On the way back it translates LSB's character ids into the PlayOnline
    Content IDs the Viewer expects, and records the pairing plus the world
-   identity dword in `ffxi_idmap.json`, which OpenLobby's login service reads
-   so its `1:3` record matches what the client was told. Without that match
-   the client refuses to open the world socket (POL-0001).
+   identity dword in the `ffxi_idmap` table of OpenLobby's PostgreSQL
+   database, which OpenLobby's login service reads so its `1:3` record matches
+   what the client was told. Without that match the client refuses to open the
+   world socket (POL-0001).
 5. After character select the client sends its world login by UDP to
    `LSB_ADVERTISE_IP:54230`; the bridge relays that to LSB's map server
    unchanged, purely so the exchange is observable.
@@ -56,11 +57,14 @@ one (`OPENLOBBY_IMAGE`) and list them all in `POL_TITLES` in OpenLobby's
 ## Prerequisites
 
 - Docker with Compose v2
-- OpenLobby running on the same Docker host, brought up with its default
-  project name (its data volume is `openlobby_pol-data`, and this stack mounts
-  it). Its login service reads the bridge's id map from that volume by
-  default (`POL_FFXI_IDMAP=/data/ffxi_idmap.json`), so nothing needs to be
-  configured on the OpenLobby side.
+- OpenLobby checked out beside this repository as `../openlobby`, with its
+  image built (`docker compose build` there, which tags `openlobby:latest`).
+  This stack runs in OpenLobby's compose project: the bridge image is built on
+  the core image, and the bridge keeps its state in the core's PostgreSQL
+  (the `ffxi_*` tables, created by the bridge at start) and reads the accounts
+  through the core's own accounts module. OpenLobby's login service reads the
+  bridge's id map from the same database, so nothing needs to be configured
+  on the OpenLobby side.
 - An FFXI client of the version the pinned LSB image expects, launched from
   the PlayOnline Viewer that OpenLobby already serves. The bridge itself does
   not care about the client version; LSB does (see Troubleshooting).
@@ -89,12 +93,19 @@ its data; pin it by digest yourself if you want reproducibility there too.
 
 ```
 cp .env.example .env      # set LSB_ADVERTISE_IP and change every password
-docker compose up -d --build
+docker compose --project-directory ../openlobby \
+    --env-file ../openlobby/.env --env-file .env \
+    -f ../openlobby/docker-compose.yml -f docker-compose.yml \
+    up -d --build db db-update db-zoneip connect search world map bridge
 ```
 
+OpenLobby's `.env` comes first so its `POL_DB_PASSWORD` reaches the bridge's
+database URL. The rest of this README writes `docker compose` for that whole
+invocation (the project directory, both env files and both compose files).
+
 Without building the bridge image (published to
-`ghcr.io/prettyopenlobby/crystalbridge` on every push), add the override:
-`docker compose -f docker-compose.yml -f docker-compose.ghcr.yml up -d`.
+`ghcr.io/prettyopenlobby/crystalbridge` on every push), add
+`-f docker-compose.ghcr.yml` after the other two files.
 
 The first start imports LSB's schema (a minute or two; `db-update` runs
 once and exits) and points every zone at `LSB_ADVERTISE_IP`. `LSB_ADVERTISE_IP`
@@ -105,14 +116,23 @@ only for a client on the same machine.
 bridge up, and `docker compose logs bridge` ends with `startup auth OK` (or
 `created the shared LSB account ... and authenticated` on a fresh database)
 and `listening on 0.0.0.0:54001`. Then run `python tools/ffxi_idmap_check.py`
-with `OPENLOBBY_DIR` pointing at your OpenLobby checkout: it proves the two
-stacks name the same id map file on the same volume, and that nothing in the
+with `OPENLOBBY_DIR` pointing at your OpenLobby checkout: it proves the bridge
+and the core's login service use the same database, and that nothing in the
 core stack publishes 54002, which LSB's search server needs.
 
-State lives in named volumes and survives restarts: `lsb-db` (the world
-database), `bridge-state` (the member-to-LSB-account map), `bridge-logs` and
-`lsb-logs`. The Content ID map lives on OpenLobby's data volume because both
-stacks read it.
+The bridge's state is two tables in OpenLobby's PostgreSQL, backed up with
+it: `ffxi_idmap` (which LSB character is which Content ID) and
+`ffxi_lsb_account` (which LSB account each member has). The rest lives in
+named volumes that survive restarts: `crystalbridge_lsb-db` (the world
+database), `crystalbridge_bridge-logs` and `crystalbridge_lsb-logs`. The bridge
+reads OpenLobby's session table from its Valkey.
+
+A deployment that ran an earlier release kept the two maps as files,
+`ffxi_idmap.json` on OpenLobby's data volume and `ffxi_accounts.json` on the
+bridge's own `bridge-state` volume. Import them before the first start of
+this one: a bridge that starts on an empty `ffxi_idmap` pairs every character
+afresh, and a character the Viewer knows under another Content ID gets
+POL-0001. The bridge log says so at start when the table is empty.
 
 ## Giving an account FINAL FANTASY XI
 
@@ -146,7 +166,7 @@ character is on:
 
 ```
 docker compose --project-directory ../openlobby -f ../openlobby/docker-compose.yml \
-    -f docker-compose.title.yml exec login python ffxititle.py /data/accounts.db trim-slots
+    -f docker-compose.title.yml exec login python ffxititle.py - trim-slots
 ```
 
 The first launch does the rest: the bridge creates the member's LSB account
@@ -198,7 +218,8 @@ docker compose run --rm --entrypoint python -v "$PWD/tools:/app/tools:ro" bridge
 docker compose restart bridge
 ```
 
-The bridge also exposes the same import as `POST /import` on port 54004 for a
+(`bind` writes the pairing to the `ffxi_idmap` table; the restart makes the
+running bridge read it.) The bridge also exposes the same import as `POST /import` on port 54004 for a
 client-side helper that knows the Viewer's session token; it binds the pairing
 in-process, so no restart is needed on that path. `BRIDGE_IMPORT_PORT=0`
 turns it off.
@@ -206,7 +227,8 @@ turns it off.
 Other admin tools, run the same way (the tools are not baked into the image,
 so they are mounted for the one command): `ffxi_provision.py list|create|rehome`
 (LSB accounts per member, and moving a character onto a member's account) and
-`ffxi_names.py` (a character-name-to-handle table for OpenLobby's database).
+`ffxi_names.py` (copies the character names the bridge has seen into
+OpenLobby's `content_character` table, and looks them up).
 
 ## Ports
 
@@ -236,9 +258,9 @@ CONF channel is the PlayOnline lobby, not LSB's.
 - **POL-0001 at character select ("writing character data to PlayOnline").**
   The client's world lookup found no entry in PlayOnline's 64-slot character
   table matching the character it picked. Either OpenLobby is not reading the
-  bridge's id map (its `POL_FFXI_IDMAP` was overridden away from
-  `/data/ffxi_idmap.json`; `tools/ffxi_idmap_check.py`; OpenLobby's lobby
-  log says `FFXI id map ... DOES NOT EXIST`), or the member has no free
+  bridge's id map (the two point at different databases;
+  `tools/ffxi_idmap_check.py`; OpenLobby's lobby log says
+  `the FFXI id map (table ffxi_idmap) does not exist`), or the member has no free
   Content ID for the character (the bridge log says `NO FREE FFXI Content
   ID`). Delete a character, or raise `POL_FFXI_CHARACTER_SLOTS` in
   OpenLobby's `.env` if the handle has room under the eight-Content-ID limit
@@ -288,10 +310,14 @@ deployments can ignore it.
 python tools/bridge_run_all.py
 ```
 
-runs the offline suite (no Docker, no LSB, no client). Three suites exercise
-OpenLobby's own modules or compose files and need a checkout of it, found via
+runs the offline suite (no LSB, no client). Most suites exercise OpenLobby's
+own modules or compose files and need a checkout of it, found via
 `OPENLOBBY_DIR` or as `../openlobby` beside this repository; without one they
-report `skip`, not failure. `tools/ffxi_bfdiff` is a C++ differential harness
+report `skip`, not failure. The suites that touch the accounts or the bridge's
+tables each get a fresh PostgreSQL database from the core's `tools/pgtest.py`:
+the runner starts one throwaway `postgres` container for the run and removes
+it at the end, or uses the server `POL_TEST_DATABASE_URL` names. Without
+either they report `skip`; `POL_TEST_REQUIRE_DB=1` makes that a failure. `tools/ffxi_bfdiff` is a C++ differential harness
 for LSB's world-packet cipher; it needs LSB's sources (its header says which)
 and is not part of the runner.
 
