@@ -1,42 +1,44 @@
-"""ffxititle.world_fields: a torn read must NOT become a sticky POL-0001.
+"""ffxititle.world_fields: a failed read must NOT become a sticky POL-0001.
 
     python tools/ffxi_idmap_read_test.py
 
 WHY (2026-09-02). The FFXI id map is written by the bridge in one container and
-read by the title plugin's `world_fields()` in another, which caches it keyed by
-the file's mtime. Two faults made an intermittent write race into a durable
-POL-0001:
+read by the title plugin's `world_fields()` in another, which caches it. Two
+faults once made an intermittent write race into a durable POL-0001:
 
-  * The bridge USED to truncate the file in place (open "w" then json.dump), so
-    a read landing mid-write parsed `{}` -- world_field 0, which is the
-    POL-0001 condition. (Fixed on the write side too: the bridge now does
-    tmp + os.replace, like its acctmap sibling.)
-  * On any parse failure `world_fields` stored `{}` UNDER THE OBSERVED
-    MTIME and returned it. If no later write moved the mtime, every subsequent
-    `1:3` was served the empty map -- the failure went sticky, not one-shot.
+  * The bridge truncated the map file in place, so a read landing mid-write
+    parsed `{}` -- world_field 0, which is the POL-0001 condition. (The map is
+    a table now, written in one transaction, so a reader cannot see half of
+    it; a read can still FAIL, which is what this pins.)
+  * On any read failure `world_fields` stored `{}` under the version it had
+    observed and returned it. If no later write moved that version, every
+    subsequent `1:3` was served the empty map -- the failure went sticky, not
+    one-shot.
 
 The fix keeps the last good map and retries on the next fetch instead of
-caching the empty result. It also now derives a world field for LEGACY FLAT
-entries `{charid: content_id}` (a restored .bak-*), which it used to skip --
-serving world field 0, i.e. POL-0001, for a map the bridge considered valid.
+caching the empty result. It also derives a world field for an entry the
+bridge has not recorded one for (world_field 0, as a map imported from the
+old flat file shape has), which it used to skip -- serving world field 0,
+i.e. POL-0001, for a map the bridge considered valid.
 
-This test drives the real function through those three cases. No network.
-Needs the OpenLobby core's `services/titles.py`: set OPENLOBBY_DIR to a
+This test drives the real function through those cases against a fresh
+PostgreSQL database. No network beyond the database. Needs the OpenLobby
+core's `services/titles.py` and `tools/pgtest.py`: set OPENLOBBY_DIR to a
 checkout of it, or keep one beside this repository as ../openlobby. Without
 it the suite SKIPS (exit 77) rather than failing.
 """
-import json
 import os
 import sys
-import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from openlobby_paths import require_services                      # noqa: E402
-require_services("ffxi_idmap_read_test")
+from openlobby_paths import require_database                      # noqa: E402
+require_database("ffxi_idmap_read_test")
 
 sys.path.insert(0, os.path.join(HERE, os.pardir, "lsb"))
+import ffxidb                                                      # noqa: E402
 import ffxititle                                                   # noqa: E402
+from polcore import db                                             # noqa: E402
 
 fails = []
 
@@ -48,49 +50,48 @@ def check(name, cond, detail=""):
 
 
 def _reset_cache():
-    ffxititle._cache.update(mtime=None, map={}, prof={})
+    ffxititle._cache.update(rev=None, map={}, prof={})
     ffxititle._missing_warned.clear()
 
 
-def main():
-    tmp = tempfile.mkdtemp(prefix="ffxi-idmap-read-")
-    path = os.path.join(tmp, "ffxi_idmap.json")
-    ffxititle.IDMAP = path
+def write(entries):
+    """Make the table hold exactly `{charid: (content_id, world_field)}`."""
+    ffxidb.write_idmap([dict(charid=int(k), content_id=cid, world_field=field,
+                             seen="2026-09-28T00:00:00Z")
+                        for k, (cid, field) in entries.items()], replace=True)
 
-    # 1) a good dict map with an explicit world_field is served verbatim.
+
+def main():
+    # 1) a row with an explicit world_field is served verbatim.
     _reset_cache()
-    with open(path, "w") as f:
-        json.dump({"17825793": {"content_id": 30000045, "name": "Cid",
-                                 "world_field": 0x11223344}}, f)
+    write({"17825793": (30000045, 0x11223344)})
     m = ffxititle.world_fields()
-    check("a dict entry's world_field is served",
+    check("a row's world_field is served",
           m.get(30000045) == 0x11223344, str(m))
     good = dict(m)
 
-    # 2) a TORN read (invalid JSON) must keep the last good map, not cache {}.
-    #    Force a new mtime so the cache does not short-circuit the read.
-    os.utime(path, (0, 0))
-    with open(path, "w") as f:
-        f.write('{"17825793": {"content_id": 3000')      # truncated: invalid
+    # 2) a FAILED read must keep the last good map, not cache {}. The change
+    #    counter moves (so the cache does not short-circuit the read) and the
+    #    table then cannot be read.
+    db.execute("UPDATE ffxi_idmap_rev SET rev = rev + 1")
+    db.execute("ALTER TABLE ffxi_idmap RENAME TO ffxi_idmap_away")
     m = ffxititle.world_fields()
-    check("a torn read keeps the previous map (no POL-0001)",
+    check("a failed read keeps the previous map (no POL-0001)",
           m == good and m.get(30000045) == 0x11223344, str(m))
+    db.execute("ALTER TABLE ffxi_idmap_away RENAME TO ffxi_idmap")
 
-    # 3) ...and it is NOT cached: once the file is whole again, the new map is
+    # 3) ...and it is NOT cached: once the table reads again, the new map is
     #    served on the very next fetch (the failure was one-shot, not sticky).
-    with open(path, "w") as f:
-        json.dump({"17825793": {"content_id": 30000045, "world_field": 0x55},
-                   "17825794": {"content_id": 30000046, "world_field": 0x66}}, f)
+    write({"17825793": (30000045, 0x55), "17825794": (30000046, 0x66)})
     m = ffxititle.world_fields()
     check("the recovered map is served on the next fetch",
           m.get(30000045) == 0x55 and m.get(30000046) == 0x66, str(m))
 
-    # 4) a LEGACY FLAT entry {charid: content_id} gets a DERIVED field, not 0.
+    # 4) an entry with no recorded world field gets a DERIVED one, not 0.
     _reset_cache()
-    with open(path, "w") as f:
-        json.dump({"17825793": 30000045}, f)             # old flat format
+    write({"17825793": (30000045, 0)})
     m = ffxititle.world_fields()
-    check("a legacy flat entry yields a non-zero derived field (not POL-0001)",
+    check("an entry with no world field yields a non-zero derived one (not POL-0001)",
           m.get(30000045, 0) != 0, str(m))
 
     print(f"\n{'ffxi_idmap_read: OK' if not fails else 'FAILURES: ' + ', '.join(fails)}")

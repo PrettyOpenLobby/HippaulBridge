@@ -30,7 +30,10 @@ were keyed by client IP, so two players behind one router replaced each
 other's LSB data session.
 
 Run from tools/: `python ffxi_bridge_test.py`. Exits non-zero on failure. No
-network, no LSB, no containers: every LSB call is stubbed.
+network and no LSB: every LSB call is stubbed. The bridge's two maps are
+tables in PostgreSQL now, so the suite gets a fresh database from the core's
+tools/pgtest.py (a throwaway container, or POL_TEST_DATABASE_URL's server) and
+checks that what the bridge decides is what it wrote there.
 """
 
 import json
@@ -42,10 +45,11 @@ import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from openlobby_paths import require_database  # noqa: E402
+require_database("ffxi_bridge_test")
 TMP = tempfile.mkdtemp(prefix="ffxi-bridge-test-")
-os.environ["FFXI_IDMAP_FILE"] = os.path.join(TMP, "ffxi_idmap.json")
-os.environ["FFXI_ACCTMAP_FILE"] = os.path.join(TMP, "ffxi_accounts.json")
-os.environ["POL_AUTH_SESSIONS"] = os.path.join(TMP, "auth-sessions.json")
+os.environ.pop("POL_VALKEY_URL", None)       # never a real stack's live state
 os.environ["FFXI_PKT_DUMP"] = "0"
 os.environ["FFXI_WORLD_CAPTURE"] = "0"
 # The 0x14 hook would otherwise start a timer that dials a database this test
@@ -53,6 +57,10 @@ os.environ["FFXI_WORLD_CAPTURE"] = "0"
 os.environ["FFXI_TOMBSTONE_DELETED"] = "0"
 sys.path.insert(0, os.path.join(HERE, os.pardir, "lsb"))
 import ffxi_bridge as B  # noqa: E402
+import ffxidb  # noqa: E402
+from polcore import kv  # noqa: E402
+KV = kv.MemoryKV()           # the core's live-state store, in process
+kv.reset(KV)
 
 FAILS = []
 
@@ -144,6 +152,12 @@ out = s2c(s2c_20([(1, b"First"), (2, b"Second"), (3, b"Third")]), 5, K)
 check(served(out) == [30000100, 30000101, 30000102],
       f"three characters, three stable ids ({served(out)})")
 
+print("   ...and a restarted bridge reads back exactly that pairing")
+before = (dict(B._idmap), dict(B._charnames))
+check(B.load_idmap() is True, "the map is read back from the database")
+check((B._idmap, B._charnames) == before,
+      f"ids and names survive the reload ({B._idmap}, {B._charnames})")
+
 # ---------------------------------------------------------------------------
 print("2. TWO CONNECTIONS CREATING AT ONCE DO NOT TRADE IDS")
 reset([30000200, 30000201, 30000300, 30000301])
@@ -164,7 +178,11 @@ now = time.time()
 
 
 def sessions(**ents):
-    json.dump(ents, open(os.environ["POL_AUTH_SESSIONS"], "w"))
+    """The core's session table as its auth service writes it: one key per
+    session, the slot as JSON."""
+    KV.flush()
+    for sid, ent in ents.items():
+        KV.set(B.AUTH_SESSION_KEY + sid, json.dumps(ent))
 
 
 sessions(uAAAA={"member_id": 1, "peer_ip": "192.0.2.1", "at": now - 30, "chars_at": now - 20, "viewer_open": True},
@@ -227,8 +245,12 @@ B._idmap.update({"1": 30000401})          # 30000400 is free and LOWER
 pkt = B.rewrite_c2s(c2s(0x14, 30000401), "c->s", 8, K)
 check(struct.unpack_from("<I", pkt, 28)[0] == 1, "0x14 delete translated to charid 1")
 check("1" not in B._idmap, "the pairing is released on the delete request")
+check(1 not in [r["charid"] for r in ffxidb.load_idmap()],
+      "...and the release is written to the database")
 out = s2c(s2c_20([(1, b"Back")]), 8, K)   # LSB refused; the char is back
 check(served(out) == [30000401], f"it comes back on 30000401, not the lower free 30000400 ({served(out)})")
+check([r["content_id"] for r in ffxidb.load_idmap() if r["charid"] == 1] == [30000401],
+      "...and the database holds charid 1 on 30000401 again")
 
 # ---------------------------------------------------------------------------
 print("5. THE ACCOUNT MAP RECORDS ONLY ACCOUNTS LSB CONFIRMED")
@@ -252,6 +274,12 @@ except Exception:
 B.lsb_auth_request = lambda *a, **k: {"result": B.LOGIN_ERROR_CREATE_TAKEN}
 login, pw = B.lsb_account_for(42)
 check("42" in B._acctmap and login == "pol42", "an account LSB already has is recorded")
+check([(r["world_tag"], r["member_id"], r["login"]) for r in ffxidb.load_accounts()]
+      == [("", 42, "pol42")],
+      "...in the database, and the unreachable attempt left nothing there")
+B._acctmap.clear()
+check(B.load_acctmap() is True and B._acctmap.get("42", {}).get("login") == "pol42",
+      "a restarted bridge reads the account back")
 
 B._acctmap.clear()
 B.lsb_auth_request = lambda *a, **k: {"result": 0x09}

@@ -9,6 +9,12 @@ is reachable (OPENLOBBY_DIR, or ../openlobby beside this repository) and SKIP
 otherwise: exit status 77, reported as `skip`, never as a failure. The C++
 harness under tools/ffxi_bfdiff needs LandSandBoat's sources and is not run.
 
+The suites that touch the account database or the bridge's own tables each
+get a fresh PostgreSQL database from the core's tools/pgtest.py. This runner
+starts one throwaway server for the whole run (unless POL_TEST_DATABASE_URL
+names one) and removes it at the end. Without Docker or that variable those
+suites SKIP; POL_TEST_REQUIRE_DB=1 makes that a failure.
+
   python tools/bridge_run_all.py            # everything
   python tools/bridge_run_all.py -k idmap   # only suites whose name contains
   python tools/bridge_run_all.py -v         # stream each suite's own output
@@ -48,6 +54,27 @@ def run(cmd, verbose):
         return -1, out + f"\n*** TIMED OUT after {TIMEOUT}s"
 
 
+def start_test_database():
+    """Start one PostgreSQL server for every suite in the run and hand them
+    its address (POL_TEST_DATABASE_URL). Nothing happens without the core's
+    pgtest.py or Docker; each suite then reports why itself."""
+    if os.environ.get("POL_TEST_DATABASE_URL", "").strip():
+        return
+    sys.path.insert(0, HERE)
+    from openlobby_paths import root_dir
+    r = root_dir()
+    tools = os.path.join(r, "tools") if r else None
+    if not tools or not os.path.isfile(os.path.join(tools, "pgtest.py")):
+        return
+    sys.path.append(tools)
+    try:
+        import pgtest
+        os.environ["POL_TEST_DATABASE_URL"] = pgtest.server_url()
+        print("  (one PostgreSQL server for the run, removed at exit)")
+    except Exception as exc:                    # noqa: BLE001 -- suites say why
+        print(f"  (no PostgreSQL server for the run: {exc})")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -67,6 +94,7 @@ def main():
         print(f"no suite matches {args.k!r}; --list shows them all")
         return 2
 
+    start_test_database()
     width = max(len(s[0]) for s in todo)
     failed, skipped = [], []
     print(f"running {len(todo)} suite(s)\n")
