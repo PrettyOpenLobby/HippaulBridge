@@ -129,10 +129,32 @@ reads OpenLobby's session table from its Valkey.
 
 A deployment that ran an earlier release kept the two maps as files,
 `ffxi_idmap.json` on OpenLobby's data volume and `ffxi_accounts.json` on the
-bridge's own `bridge-state` volume. Import them before the first start of
-this one: a bridge that starts on an empty `ffxi_idmap` pairs every character
-afresh, and a character the Viewer knows under another Content ID gets
-POL-0001. The bridge log says so at start when the table is empty.
+bridge's own `bridge-state` volume (`crystalbridge_bridge-state`, from when
+the bridge was a compose project of its own). Import them before the first
+start of this one, after OpenLobby's own import (its docs/database.md,
+"Moving an existing /data"), from this directory:
+
+```
+DC="docker compose --project-directory ../openlobby --env-file ../openlobby/.env --env-file .env -f ../openlobby/docker-compose.yml -f docker-compose.yml"
+$DC run --rm --no-deps --entrypoint python bridge ffxidb.py import idmap /data/ffxi_idmap.json
+$DC run --rm --no-deps -v crystalbridge_bridge-state:/state:ro --entrypoint python bridge ffxidb.py import accounts /state/ffxi_accounts.json
+```
+
+Each reads its file without changing it, runs in one transaction, prints what
+it imported and each entry it could not map, and refuses a table that already
+holds rows unless given `--merge`, which adds only the keys the table lacks.
+`--dry-run` prints the same report and writes nothing. Running one again
+changes nothing.
+
+A bridge that starts on an empty `ffxi_idmap` pairs every character afresh,
+and a character the Viewer knows under another Content ID gets POL-0001. So
+while the table is empty and `/data/ffxi_idmap.json` (the core's data volume,
+mounted read-only) still holds pairings, the bridge does not open its ports:
+it logs `NOT STARTING` with the command to run, and opens by itself once the
+table holds rows. `FFXI_IDMAP_START_EMPTY=1` starts it on the empty table
+anyway. On a new stack there is no old file, and the bridge starts at once.
+A missing `ffxi_lsb_account` costs nothing lasting: the bridge records each
+member's account again at their next launch.
 
 ## Giving an account FINAL FANTASY XI
 
