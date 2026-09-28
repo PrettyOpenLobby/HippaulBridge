@@ -15,15 +15,22 @@ starts one throwaway server for the whole run (unless POL_TEST_DATABASE_URL
 names one) and removes it at the end. Without Docker or that variable those
 suites SKIP; POL_TEST_REQUIRE_DB=1 makes that a failure.
 
+POL_DATA_DIR, POL_RESOURCE_DIR, POL_LOG_DIR and POL_LOGIN_PW_KEYFILE that
+are not set point into a temporary directory made for the run and removed
+at the end (scratch_state).
+
   python tools/bridge_run_all.py            # everything
   python tools/bridge_run_all.py -k idmap   # only suites whose name contains
   python tools/bridge_run_all.py -v         # stream each suite's own output
 """
 import argparse
+import atexit
 import glob
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -75,7 +82,45 @@ def start_test_database():
         print(f"  (no PostgreSQL server for the run: {exc})")
 
 
+#: The state paths a suite falls back to when they are unset (see scratch_state).
+SCRATCH_VARS = ("POL_DATA_DIR", "POL_RESOURCE_DIR", "POL_LOG_DIR",
+                "POL_LOGIN_PW_KEYFILE")
+
+
+def scratch_state():
+    """Point every state path a suite may fall back to at a directory made
+    for this run and removed when it ends, unless the caller set it.
+
+    A suite that finds no POL_DATA_DIR uses /data, which on Windows is the
+    root of the current drive, so a run could read and write a real server's
+    files there. A value already set wins; POL_RESOURCE_DIR then follows
+    POL_DATA_DIR, as the services derive it. Returns the directory made, or
+    None when every variable was set.
+    """
+    missing = [k for k in SCRATCH_VARS if not os.environ.get(k, "").strip()]
+    if not missing:
+        return None
+    root = tempfile.mkdtemp(prefix="bridge-run-")
+    atexit.register(shutil.rmtree, root, True)
+    if "POL_DATA_DIR" in missing:
+        os.environ["POL_DATA_DIR"] = os.path.join(root, "data")
+        os.makedirs(os.environ["POL_DATA_DIR"])
+    if "POL_RESOURCE_DIR" in missing:
+        os.environ["POL_RESOURCE_DIR"] = os.path.join(os.environ["POL_DATA_DIR"],
+                                                      "resources")
+        if os.environ["POL_RESOURCE_DIR"].startswith(root):
+            os.makedirs(os.environ["POL_RESOURCE_DIR"], exist_ok=True)
+    if "POL_LOG_DIR" in missing:
+        os.environ["POL_LOG_DIR"] = os.path.join(root, "logs")
+        os.makedirs(os.environ["POL_LOG_DIR"])
+    if "POL_LOGIN_PW_KEYFILE" in missing:
+        os.makedirs(os.path.join(root, "keys"))
+        os.environ["POL_LOGIN_PW_KEYFILE"] = os.path.join(root, "keys", "login-pw.key")
+    return root
+
+
 def main():
+    scratch_state()
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-k", action="append", default=[],
