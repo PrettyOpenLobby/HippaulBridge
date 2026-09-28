@@ -237,6 +237,9 @@ services:
       # LSB soft-deletes a character and keeps its name taken; the bridge
       # renames each parked row to del<charid> so the name can be reused.
       FFXI_TOMBSTONE_DELETED: "${FFXI_TOMBSTONE_DELETED:-1}"
+      # Seconds between polls of LSB's accounts_sessions for the in-world
+      # feed (which character each member is playing); 0 turns it off.
+      FFXI_INGAME_PERIOD: "${FFXI_INGAME_PERIOD:-}"
       # The bridge does not open while ffxi_idmap is empty and the id map an
       # earlier release kept (ffxi_idmap.json on the core's data volume,
       # mounted read-only below) still holds pairings: it waits for

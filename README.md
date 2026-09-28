@@ -207,6 +207,16 @@ each delete and every ten minutes, which frees the name and keeps the row for
 recovery. The same sweep releases the Content ID of any parked charid a stale
 character list re-paired. `FFXI_TOMBSTONE_DELETED=0` turns it off.
 
+The bridge also polls LSB's `accounts_sessions` every `FFXI_INGAME_PERIOD`
+seconds (default 5; 0 turns it off) and publishes which character each member
+is playing in the core's live-state store, under `ffxi:ingame`. With
+`POL_FFXI_INGAME_PUSH=1` on the core's `authsess` (docker-compose.title.yml),
+the plugin puts that character in the friend-status record the member's
+friends are sent while the member's client says it is in FFXI: +0x12 set, and
+the record's 0x08 field filled with the character's world field and Content
+ID, laid out as LandSandBoat's xi_profile names it. It is off by default
+because no Viewer has been seen to draw it yet.
+
 Attribution needs a signed-in Viewer session. The FFXI lobby stream carries no
 PlayOnline identity, so the bridge reads OpenLobby's session table: one
 signed-in session at the client's address is the answer; two behind one NAT

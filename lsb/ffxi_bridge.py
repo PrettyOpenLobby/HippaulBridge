@@ -2808,6 +2808,92 @@ def tombstone_loop():
         tombstone_deleted_names(why="")
 
 
+# ---------------------------------------------------------------------------
+# WHO IS IN THE WORLD, AND AS WHICH CHARACTER
+#
+# The friend list already learns "in FINAL FANTASY XI" from the client's own
+# 4:5, but never WHICH character, and a crashed client leaves that latch set.
+# LSB knows both: `accounts_sessions` holds one row per character in the world
+# (inserted at the 0xA2 handoff, deleted on logout). LandSandBoat's own profile
+# server (xi_profile, PR #11639) reads the same row for its friend notices.
+#
+# So the bridge polls it and publishes `{member: character}` in the core's
+# live-state store (INGAME_KEY); the title plugin inside authsess
+# (ffxititle.presence_character) reads it for the friend-status record.
+# Members are resolved through the account map by LOGIN, never by parsing
+# "pol<n>": a rehomed account keeps its old login.
+#
+#   FFXI_INGAME_PERIOD  seconds between polls; 0 disables (5)
+# ---------------------------------------------------------------------------
+#: The live-state key (polcore.kv) the map is published under. ffxititle.py
+#: reads the same name (INGAME_KEY there).
+INGAME_KEY = "ffxi:ingame"
+INGAME_PERIOD = float(os.environ.get("FFXI_INGAME_PERIOD") or 5)
+
+
+def ingame_snapshot(rows, acctmap, idmap, charnames, worldfields):
+    """`{str(member): {...}}` from `(login, charid)` rows. Pure, for the test.
+
+    A row whose login is not ours (poltest, a hand-made account) or whose charid
+    has no Content ID is skipped: the Viewer can only be told about a character
+    it has in its own 1:3 table, and that table is built from the same map.
+    Only the primary world's accounts are members here (a `tag:id` key is
+    another world's)."""
+    by_login = {v.get("login"): k for k, v in (acctmap or {}).items()
+                if isinstance(v, dict) and v.get("login") and str(k).isdigit()}
+    out = {}
+    for login, charid in rows:
+        member = by_login.get(login)
+        key = str(charid)
+        cid = idmap.get(key)
+        if member is None or cid is None:
+            continue
+        out[str(member)] = {"charid": int(charid), "content_id": int(cid),
+                            "world_field": int(worldfields.get(key, 0)),
+                            "name": charnames.get(key, "")}
+    return out
+
+
+def publish_ingame(state):
+    """Write the map. It expires if the bridge stops publishing, so a bridge
+    that dies does not leave everybody in the world."""
+    ffxidb.kv().set_json(INGAME_KEY, state,
+                         ttl=max(30.0, 3 * INGAME_PERIOD))
+
+
+def ingame_loop():
+    """Poll accounts_sessions and republish the map every period."""
+    conn, err = session_key_connect()
+    last = None
+    while True:
+        try:
+            if conn is None:
+                conn, err = session_key_connect()
+            if conn is not None:
+                conn.ping(reconnect=True)
+                with conn.cursor() as cur:
+                    cur.execute("SELECT a.login, s.charid FROM accounts_sessions s "
+                                "JOIN accounts a ON a.id = s.accid")
+                    rows = cur.fetchall()
+                with _acctmap_lock:
+                    acct = dict(_acctmap)
+                with _idmap_lock:
+                    state = ingame_snapshot(rows, acct, dict(_idmap),
+                                            dict(_charnames), dict(_worldfields))
+                publish_ingame(state)
+                if state != last:
+                    log("ingame", f"in the world: "
+                                  f"{ {m: v['name'] or v['charid'] for m, v in state.items()} or 'nobody'}")
+                    last = state
+            elif err:
+                log("ingame", f"not polling: {err}")
+                err = None                    # say it once per outage
+        except Exception as exc:
+            log("ingame", f"poll failed ({exc!r}); reconnecting")
+            conn = None
+        time.sleep(INGAME_PERIOD)
+
+
 def do_import(dump, member_id):
     """Import a polexport dump for a member. Returns (ok, message, charid)."""
     try:
@@ -3087,6 +3173,11 @@ def main():
         threading.Thread(target=tombstone_loop, daemon=True).start()
     else:
         log("boot", "deleted-name tombstoning OFF (FFXI_TOMBSTONE_DELETED=0)")
+    if INGAME_PERIOD > 0:
+        threading.Thread(target=ingame_loop, daemon=True).start()
+        log("boot", f"in-world feed -> kv {INGAME_KEY} every {INGAME_PERIOD:g}s")
+    else:
+        log("boot", "in-world feed OFF (FFXI_INGAME_PERIOD=0)")
     threading.Thread(target=listener, args=(BRIDGE_VIEW, LSB_VIEW_PORT, "VIEW"), daemon=True).start()
     threading.Thread(target=listener, args=(BRIDGE_DATA, LSB_DATA_PORT, "DATA"), daemon=True).start()
     if BRIDGE_MAP:
