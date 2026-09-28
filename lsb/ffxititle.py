@@ -15,24 +15,26 @@ Content ID per CHARACTER, so a handle holding FFXI is given CHARACTER_SLOTS of
 them (`content_slots`, which the core's accounts module reads), and the
 operator command that trims the extra ones back (`trim-slots`, below).
 
-Both come from the id map the bridge writes on the shared data volume
-(FFXI_IDMAP_FILE there, POL_FFXI_IDMAP here): `{charid: {"content_id": N,
-"world_field": dword, "profile": {...}}}`. The map is re-read whenever its
-mtime moves, because the bridge rewrites it the moment a character is created
-and the client re-fetches 1:3 about three seconds later.
+Both come from the id map the bridge writes, the ffxi_idmap table in the
+core's own PostgreSQL database (one row per charid: content_id, world_field,
+profile; lsb/ffxi_migrations/). The map is cached and re-read whenever its
+change counter (ffxi_idmap_rev) moves, because the bridge writes it the moment
+a character is created and the client re-fetches 1:3 about three seconds
+later.
 
 Loaded with POL_TITLES=ffxititle in the core's login and authsess services;
 see docker-compose.title.yml.
 
-    python ffxititle.py DB trim-slots [--apply] [--handle NAME] [--idmap PATH]
+    python ffxititle.py DB trim-slots [--apply] [--handle NAME]
                                       [--force] [--restore]
 """
 import argparse
-import json
 import os
 import sys
 
 import titles
+
+import ffxidb
 
 #: FFXI's content code: the N of prof_001.pfb, and the value the client's
 #: world lookup insists on finding at character-table +0x02.
@@ -41,7 +43,8 @@ CONTENT_CODE = 1
 #: the profile's slots for the six values the bridge records (prof_001.pfb)
 SLOT_WORLD, SLOT_NATION, SLOT_ZONE, SLOT_JOB, SLOT_JOBLEVEL, SLOT_RACE = 6, 7, 8, 9, 10, 11
 
-IDMAP = os.environ.get("POL_FFXI_IDMAP", "/data/ffxi_idmap.json")
+#: The bridge's id map, in the core's database (POL_DATABASE_URL).
+IDMAP = ffxidb.IDMAP_TABLE
 #: Only used to DERIVE a world field for a character the bridge has recorded
 #: a charid for but not yet a world_field. Must agree with the bridge's
 #: FFXI_WORLD_ID / FFXI_WORLD_ID_FIX.
@@ -64,7 +67,7 @@ WORLD_ID = int(os.environ.get("POL_FFXI_WORLD_ID", "0x20"), 0)
 #: explanation. `trim-slots` cleans that up.
 CHARACTER_SLOTS = max(1, int(os.environ.get("POL_FFXI_CHARACTER_SLOTS") or 1))
 
-_cache = {"mtime": None, "map": {}, "prof": {}}
+_cache = {"rev": None, "map": {}, "prof": {}}
 _missing_warned = set()
 
 
@@ -89,43 +92,48 @@ def world_fields():
     launch-relogin-launch cycle before FFXI could connect: the table is filled
     at POL login and the field is only learned once the game is already
     running. The recorded value always wins; it is what the client was told.
+
+    A read that fails keeps the last good map and is retried on the next
+    fetch; it is never cached as empty, which would turn one database fault
+    into a POL-0001 that lasts until the bridge next writes.
     """
     try:
-        mtime = os.path.getmtime(IDMAP)
-    except OSError:
+        rev = ffxidb.idmap_rev()
+    except Exception as exc:
+        _log(f"FFXI id map (table {IDMAP}) unreadable ({exc!r}); keeping the "
+             f"previous map ({len(_cache['map'])} entries) and retrying on the "
+             f"next fetch")
+        return _cache["map"]
+    if rev is None:
         if IDMAP not in _missing_warned:
             _missing_warned.add(IDMAP)
-            _log(f"WARNING: FFXI id map {IDMAP} does not exist: every FFXI "
-                 f"character will be served world field 0, and FFXI will refuse "
-                 f"the world connect (POL-0001). If the bridge is running, "
-                 f"POL_FFXI_IDMAP disagrees with its FFXI_IDMAP_FILE.")
+            _log(f"WARNING: the FFXI id map (table {IDMAP}) does not exist in "
+                 f"this database: every FFXI character will be served world "
+                 f"field 0, and FFXI will refuse the world connect (POL-0001). "
+                 f"The bridge creates it when it starts; if it is running, it "
+                 f"is pointed at a different POL_DATABASE_URL.")
         return {}
     _missing_warned.discard(IDMAP)
-    if _cache["mtime"] == mtime:
+    if _cache["rev"] == rev:
         return _cache["map"]
     out, prof = {}, {}
     try:
-        with open(IDMAP, "r", encoding="utf-8") as fh:
-            raw = json.load(fh)
-        for charid, ent in raw.items():
-            if isinstance(ent, dict):
-                if not ent.get("content_id"):
-                    continue
-                cid = int(ent["content_id"])
-                field = int(ent.get("world_field") or 0) & 0xFFFFFFFF
-                if isinstance(ent.get("profile"), dict):
-                    prof[cid] = dict(ent["profile"])
-            else:
-                cid = int(ent)
-                field = 0
+        for ent in ffxidb.read_idmap_rows():
+            if not ent.get("content_id"):
+                continue
+            cid = int(ent["content_id"])
+            field = int(ent.get("world_field") or 0) & 0xFFFFFFFF
+            if isinstance(ent.get("profile"), dict):
+                prof[cid] = dict(ent["profile"])
             if not field:
-                field = derive_world_field(charid)
+                field = derive_world_field(ent["charid"])
             out[cid] = field
     except Exception as exc:
-        _log(f"FFXI id map {IDMAP} unreadable ({exc!r}); keeping the previous "
-             f"map ({len(_cache['map'])} entries) and retrying on the next fetch")
+        _log(f"FFXI id map (table {IDMAP}) unreadable ({exc!r}); keeping the "
+             f"previous map ({len(_cache['map'])} entries) and retrying on the "
+             f"next fetch")
         return _cache["map"]
-    _cache["mtime"] = mtime
+    _cache["rev"] = rev
     _cache["map"] = out
     _cache["prof"] = prof
     return out
@@ -134,8 +142,8 @@ def world_fields():
 def char_fields(cid):
     """The profile tail the bridge recorded for one Content ID, or {}.
 
-    Goes through `world_fields` so the two share one mtime poll and can never
-    be a write apart. Empty for a character whose char list the bridge has not
+    Goes through `world_fields` so the two share one read of the change
+    counter and can never be a write apart. Empty for a character whose char list the bridge has not
     seen; the profile then leaves those fields unset, which is correct: a zero
     Job Level would read as a fact.
     """
@@ -146,34 +154,24 @@ def char_fields(cid):
     return _cache.get("prof", {}).get(int(cid)) or {}
 
 
-def ids_in_use(path=None):
+def ids_in_use(conn=None):
     """`{Content ID (str): character name}` for every FFXI character the bridge
-    has paired. Raises OSError or ValueError if the map cannot be read.
+    has paired, read from the id map table (through `conn`, an account
+    database connection, when given). Raises if the map cannot be read,
+    including when the table does not exist.
 
     WARNING: **A FAILURE HERE IS NOT "NOTHING IS IN USE".** This is the check
     that stands between an operator and deactivating the Content ID a live
     character is named after; that character then misses POL's table and is
     POL-0001 at select, for ever, with nothing on screen to explain it. So it
     RAISES rather than returning an empty dict, and `trim-slots` refuses to
-    write when it does.
-
-    Both on-disk shapes `ffxi_bridge.save_idmap` has used are read: the
-    original flat `{"<charid>": <ContentID>}` and the current
-    `{"<charid>": {"content_id": N, "name": "Fox", ...}}`. An entry in neither
-    shape raises too: a map we cannot parse is a map we cannot vouch for.
+    write when it does. A character the bridge has not learned a name for
+    yet is reported as `charid N`.
     """
-    path = path or IDMAP
-    with open(path, "r", encoding="utf-8") as fh:
-        raw = json.load(fh)
-    if not isinstance(raw, dict):
-        raise ValueError("%s: expected an object, got %s"
-                         % (path, type(raw).__name__))
     out = {}
-    for charid, val in raw.items():
-        if isinstance(val, dict):
-            out[str(int(val["content_id"]))] = val.get("name") or ("charid " + str(charid))
-        else:
-            out[str(int(val))] = "charid " + str(charid)
+    for row in ffxidb.read_idmap_rows(conn):
+        out[str(int(row["content_id"]))] = (row.get("name")
+                                            or "charid %d" % int(row["charid"]))
     return out
 
 
@@ -183,7 +181,7 @@ class FinalFantasyXI(titles.Title):
     content_slots = CHARACTER_SLOTS
 
     def describe(self):
-        return f"FFXI id map {IDMAP}"
+        return f"FFXI id map (table {IDMAP})"
 
     def character_world(self, cid):
         try:
@@ -213,27 +211,22 @@ def register():
 
 
 # --- operator command ------------------------------------------------------- #
-def trim_slots(conn, accounts, apply=False, handle=None, idmap=None,
+def trim_slots(conn, accounts, apply=False, handle=None,
                force=False, restore=False):
     """Deactivate the EXTRA FFXI Content IDs (slot <> 0) that push a handle
     past the core's ceiling of eight, which makes the Viewer refuse to open
     FFXI from it at all (string 26069). Reports by default; `apply` writes.
     Skips any id a character is already on. Returns the exit status.
 
-    What it deactivates is recorded in `handle_content_trimmed`, so `restore`
-    puts exactly that back.
+    What it deactivates is recorded in `handle_content_trimmed` (part of the
+    core's schema), so `restore` puts exactly that back.
     """
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS handle_content_trimmed ("
-        " handle_id INTEGER NOT NULL, content_code INTEGER NOT NULL,"
-        " slot INTEGER NOT NULL, content_id TEXT, prev_status TEXT,"
-        " trimmed_at TEXT)")
     if restore:
         n = 0
         for r in conn.execute("SELECT * FROM handle_content_trimmed").fetchall():
             n += conn.execute(
-                "UPDATE handle_content SET status = ? WHERE handle_id = ?"
-                " AND content_code = ? AND slot = ?",
+                "UPDATE handle_content SET status = %s WHERE handle_id = %s"
+                " AND content_code = %s AND slot = %s",
                 (r["prev_status"], r["handle_id"], r["content_code"],
                  r["slot"])).rowcount
         conn.execute("DELETE FROM handle_content_trimmed")
@@ -246,19 +239,20 @@ def trim_slots(conn, accounts, apply=False, handle=None, idmap=None,
     # raises rather than shrugging.
     inuse, why = {}, None
     try:
-        inuse = ids_in_use(idmap)
+        inuse = ids_in_use(conn)
     except Exception as exc:
-        why = "%s: %s" % (exc.__class__.__name__, exc)
-        print("WARNING: could not read the FFXI id map (%s)" % why)
+        why = "%s: %s" % (exc.__class__.__name__, str(exc).strip())
+        print("WARNING: could not read the FFXI id map, table %s (%s)"
+              % (IDMAP, why))
         print("  so this cannot tell which ids have a character on them.")
 
     ceiling = accounts.CONTENT_IDS_PER_HANDLE
     q = ("SELECT h.id AS hid, h.handle_name, c.slot, c.content_id, c.status"
          "  FROM handle_content c JOIN handle h ON h.id = c.handle_id"
-         " WHERE c.content_code = ? AND c.slot <> 0")
+         " WHERE c.content_code = %s AND c.slot <> 0")
     params = [CONTENT_CODE]
     if handle:
-        q += " AND h.handle_name = ?"
+        q += " AND h.handle_name = %s"
         params.append(handle)
     rows = conn.execute(q + " ORDER BY h.id, c.slot", params).fetchall()
     if not rows:
@@ -285,8 +279,9 @@ def trim_slots(conn, accounts, apply=False, handle=None, idmap=None,
         return 0
     if why and not force:
         print("REFUSING to write: the id map could not be read, so a trim could "
-              "silently kill a live character. Fix the path (--idmap / "
-              "POL_FFXI_IDMAP) or pass --force.", file=sys.stderr)
+              "silently kill a live character. Start the bridge against this "
+              "database (it creates table %s) or pass --force." % IDMAP,
+              file=sys.stderr)
         return 1
     now = accounts._now()
     n = 0
@@ -297,12 +292,13 @@ def trim_slots(conn, accounts, apply=False, handle=None, idmap=None,
             continue
         conn.execute(
             "INSERT INTO handle_content_trimmed (handle_id, content_code,"
-            " slot, content_id, prev_status, trimmed_at) VALUES (?,?,?,?,?,?)",
+            " slot, content_id, prev_status, trimmed_at)"
+            " VALUES (%s,%s,%s,%s,%s,%s)",
             (r["hid"], CONTENT_CODE, r["slot"], r["content_id"],
              r["status"], now))
         n += conn.execute(
-            "UPDATE handle_content SET status = 'inactive' WHERE handle_id = ?"
-            " AND content_code = ? AND slot = ?",
+            "UPDATE handle_content SET status = 'inactive' WHERE handle_id = %s"
+            " AND content_code = %s AND slot = %s",
             (r["hid"], CONTENT_CODE, r["slot"])).rowcount
     conn.commit()
     print("deactivated %d row(s); `trim-slots --restore` puts them back" % n)
@@ -314,17 +310,16 @@ def main(argv=None):
     ap = argparse.ArgumentParser(
         prog="ffxititle.py",
         description="FFXI operator commands on the core's account database.")
-    ap.add_argument("db", help="path to accounts.db")
+    ap.add_argument("db", help="the account database: a postgresql:// URL, or "
+                               "anything else for POL_DATABASE_URL")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("trim-slots", help="deactivate the extra FFXI Content IDs that push a "
                        "handle past the ceiling of eight; reports unless --apply")
     p.add_argument("--apply", action="store_true",
                    help="actually write; without it this only reports")
     p.add_argument("--handle", help="just this handle (name), not every one")
-    p.add_argument("--idmap", help="path to the bridge's id map (default "
-                                   "POL_FFXI_IDMAP, else /data/ffxi_idmap.json)")
     p.add_argument("--force", action="store_true",
-                   help="write even when the idmap is unreadable, or when a "
+                   help="write even when the id map is unreadable, or when a "
                         "character IS on an id. That character becomes "
                         "unplayable (POL-0001 at select). Say so out loud first")
     p.add_argument("--restore", action="store_true",
@@ -335,7 +330,7 @@ def main(argv=None):
     conn = accounts.connect(args.db)
     try:
         return trim_slots(conn, accounts, apply=args.apply, handle=args.handle,
-                          idmap=args.idmap, force=args.force,
+                          force=args.force,
                           restore=args.restore)
     finally:
         conn.close()
