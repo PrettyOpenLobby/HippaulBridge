@@ -74,11 +74,13 @@ Env knobs (defaults target an LSB on 127.0.0.1 at its stock ports):
   BRIDGE_VIEW_PORT (54001), BRIDGE_DATA_PORT (54230)
   LSB_ACCOUNT, LSB_PASSWORD  (the LSB account to auth as)
   FFXI_ID_MAP=0             disable the Content-ID translation (old behaviour)
-  FFXI_POL_CONTENT_IDS      comma list overriding the ids read from accounts.db
-  POL_ACCOUNTS_DB           path to accounts.db (default ../data/accounts.db)
-  POL_AUTH_SESSIONS         the core stack's session table (auth-sessions.json)
-  FFXI_IDMAP_FILE           where the charid<->ContentID map is persisted
-  FFXI_ACCTMAP_FILE         where the member->LSB account map is persisted
+  FFXI_POL_CONTENT_IDS      comma list overriding the ids read from the accounts
+  POL_DATABASE_URL          the core's PostgreSQL: the accounts (read through
+                            the core's accounts module) and the bridge's own
+                            ffxi_* tables (the charid<->ContentID map and the
+                            member->LSB account map; lsb/ffxidb.py)
+  POL_VALKEY_URL            the core's Valkey, where its auth service keeps the
+                            live session table (which member is signed in where)
   FFXI_ACCT_SECRET          seed the per-member LSB passwords derive from
   FFXI_PKT_DUMP=0           stop writing raw packet captures under FFXI_PKT_DIR
   FFXI_WORLD_CAPTURE=0      stop capturing world UDP traffic (default ON; one
@@ -97,7 +99,6 @@ import hashlib
 import json
 import os
 import socket
-import sqlite3
 import ssl
 import struct
 import sys
@@ -199,10 +200,10 @@ def r_name(): return getattr(_ROUTE, 'name', None) or 'primary'
 def r_tag():
     """Short, stable id for the routed world -- '' for the primary.
 
-    Used to key ffxi_accounts.json. An LSB account exists only in the instance
-    it was created in, so one shared map would have the alt world try to log in
-    with accounts that live in the primary and skip creating its own. The
-    primary keeps BARE keys so the existing file stays valid.
+    Used to key the LSB account map (ffxi_lsb_account.world_tag). An LSB
+    account exists only in the instance it was created in, so one shared map
+    would have the alt world try to log in with accounts that live in the
+    primary and skip creating its own.
     """
     return getattr(_ROUTE, 'tag', None) or ''
 
@@ -307,9 +308,10 @@ CHR_REC_ZONE_HI   = 0x4F            # zone_no2    u8  (+35), bit 8 of the zone
 WORLD_LIST_FIRST_NO = HDR_LEN + 4
 PKT_DUMP     = os.environ.get("FFXI_PKT_DUMP", "1") == "1"
 _HERE        = os.path.dirname(os.path.abspath(__file__))
-ACCOUNTS_DB  = os.environ.get("POL_ACCOUNTS_DB",
-                              os.path.join(_HERE, os.pardir, "data", "accounts.db"))
-IDMAP_FILE   = os.environ.get("FFXI_IDMAP_FILE", os.path.join(_HERE, "ffxi_idmap.json"))
+sys.path.insert(0, _HERE)
+import ffxidb  # noqa: E402  (imports nothing from the core until called)
+#: Where the id map lives, for the log lines.
+IDMAP_WHERE  = f"table {ffxidb.IDMAP_TABLE}"
 PKT_DIR      = os.environ.get("FFXI_PKT_DIR",
                               os.path.join(_HERE, os.pardir, "logs", "lsb", "pkt"))
 
@@ -326,11 +328,12 @@ def hexdump(b, limit=64):
 # ---------------------------------------------------------------------------
 # PlayOnline Content ID <-> LSB charid
 #
-# POL's side of the pairing comes from accounts.db: every `handle_content` row
-# with content_code 1 is one FFXI Content ID, i.e. one character slot the member
-# is entitled to. LSB's side is the charid it invents. The map is persisted so a
-# character keeps the same Content ID across bridge restarts -- the Viewer caches
-# the pairing locally, so a churning map would look like the character moved to a
+# POL's side of the pairing comes from the core's accounts: every
+# `handle_content` row with content_code 1 is one FFXI Content ID, i.e. one
+# character slot the member is entitled to. LSB's side is the charid it
+# invents. The map is persisted (the ffxi_idmap table) so a character keeps
+# the same Content ID across bridge restarts -- the Viewer caches the pairing
+# locally, so a churning map would look like the character moved to a
 # different Content ID.
 # ---------------------------------------------------------------------------
 _idmap_lock = threading.Lock()
@@ -363,23 +366,24 @@ def pol_content_ids(member_id=None):
     if member_id is None:
         return load_pol_content_ids()
     try:
-        db = sqlite3.connect(ACCOUNTS_DB, timeout=5.0)
+        A = ffxidb.accounts()
+        conn = A.connect()
         try:
-            db.execute("PRAGMA query_only = 1")
-            rows = db.execute(
-                "SELECT hc.content_id FROM handle_content hc "
-                "JOIN handle h ON h.id = hc.handle_id "
-                "WHERE h.member_id = ? AND hc.content_code = 1 "
-                "AND hc.status = 'active'", (int(member_id),)).fetchall()
+            rows = A.member_content_id_list(conn, int(member_id), 1)
         finally:
-            db.close()
+            conn.close()
     except Exception as exc:
-        log("idmap", f"accounts.db read failed for member {member_id} ({exc!r})")
+        log("idmap", f"account read failed for member {member_id} ({exc!r})")
         return []
-    out = []
-    for (cid,) in rows:
+    return _content_id_ints(rows)
+
+
+def _content_id_ints(values):
+    """Stored Content IDs (TEXT in two widths) as sorted, distinct ints."""
+    out = set()
+    for cid in values:
         try:
-            out.append(int(str(cid).strip()))
+            out.add(int(str(cid).strip()))
         except (TypeError, ValueError):
             continue
     return sorted(out)
@@ -393,101 +397,92 @@ def load_pol_content_ids():
     env = os.environ.get("FFXI_POL_CONTENT_IDS", "").strip()
     if env:
         return [int(x) for x in env.replace(";", ",").split(",") if x.strip()]
-    # NOT `mode=ro`: accounts.db is in WAL, and a read-only handle cannot create
-    # the -shm index a WAL reader needs, so it fails with "attempt to write a
-    # readonly database". A normal handle with `query_only` is the supported way
-    # to read a WAL database without being able to modify it -- which matters
-    # here, because this file has been truncated once before by careless writers
-    # over a bind mount.
-    rows = []
     try:
-        db = sqlite3.connect(ACCOUNTS_DB, timeout=5.0)
+        A = ffxidb.accounts()
+        conn = A.connect()
         try:
-            db.execute("PRAGMA query_only = 1")
-            rows = db.execute(
-                "SELECT DISTINCT content_id FROM handle_content "
-                "WHERE content_code = 1 AND status = 'active'").fetchall()
+            rows = A.content_id_list(conn, 1)
         finally:
-            db.close()
+            conn.close()
     except Exception as exc:
-        log("idmap", f"accounts.db read failed ({exc!r}); no Content IDs known")
+        log("idmap", f"account read failed ({exc!r}); no Content IDs known")
         return []
-    out = []
-    for (cid,) in rows:
-        try:
-            out.append(int(str(cid).strip()))
-        except (TypeError, ValueError):
-            continue
-    return sorted(out)
+    return _content_id_ints(rows)
 
 
 def load_idmap():
-    """Read the persisted map.
+    """Read the persisted map (the ffxi_idmap table) into memory.
 
-    Two on-disk shapes are accepted. The original was a flat
-    `{"<charid>": <ContentID>}`; the current one is
-    `{"<charid>": {"content_id": N, "name": "Alice", "seen": "<iso>"}}`, which also
-    carries the FFXI CHARACTER NAME -- the missing half of the POL identity
-    chain (character name -> Content ID -> handle). Old files still load.
+    Returns False when the database could not be read; the in-memory map is
+    then left EMPTY, and the caller decides whether that is safe to run on.
+
+    Each row carries the charid, its Content ID, the FFXI CHARACTER NAME -- the
+    missing half of the POL identity chain (character name -> Content ID ->
+    handle) -- the world field and the profile tail. A name of '' and a world
+    field of 0 mean "not seen yet"; so does a NULL profile.
     """
-    global _idmap, _charnames, _charfields
-    _idmap, _charnames, _charfields = {}, {}, {}
+    global _idmap, _charnames, _charfields, _worldfields
+    _idmap, _charnames, _charfields, _worldfields = {}, {}, {}, {}
     try:
-        with open(IDMAP_FILE, "r", encoding="utf-8") as fh:
-            raw = json.load(fh)
-    except FileNotFoundError:
-        # A missing file is legitimate on a brand-new stack and a BUG on a
-        # misconfigured one (wrong FFXI_IDMAP_FILE / wrong mount) -- and the
-        # two used to be indistinguishable because this branch was silent.
-        # Starting empty on a misconfigured stack RE-ALLOCATES Content IDs in
-        # whatever order the next 0x20 arrives, permuting pairings the Viewer
-        # has cached (= POL-0001). Say so once, loudly, like responders does.
-        log("idmap", f"{IDMAP_FILE} does not exist -- starting with an EMPTY "
-                     f"map. Correct on first boot; if characters exist, this "
-                     f"path is WRONG and pairings will be re-dealt.")
-        return
+        rows = ffxidb.load_idmap()
     except Exception as exc:
-        log("idmap", f"{IDMAP_FILE} unreadable ({exc!r}); starting empty")
-        return
-    global _worldfields
-    _worldfields = {}
-    for k, v in raw.items():
-        if isinstance(v, dict):
-            _idmap[str(k)] = int(v["content_id"])
-            if v.get("name"):
-                _charnames[str(k)] = v["name"]
-            if v.get("world_field"):
-                _worldfields[str(k)] = int(v["world_field"])
-            if isinstance(v.get("profile"), dict):
-                _charfields[str(k)] = dict(v["profile"])
+        log("idmap", f"{IDMAP_WHERE} unreadable ({exc!r}); starting empty")
+        return False
+    if not rows:
+        # An empty map is legitimate on a brand-new stack and a BUG on one
+        # whose map was never moved over (the old ffxi_idmap.json not
+        # imported, or the bridge pointed at the wrong database). Starting
+        # empty there RE-ALLOCATES Content IDs in whatever order the next 0x20
+        # arrives, permuting pairings the Viewer has cached (= POL-0001). Say
+        # so once, loudly.
+        log("idmap", f"{IDMAP_WHERE} is EMPTY. Correct on first boot; if "
+                     f"characters exist, this database is the WRONG one (or "
+                     f"the old ffxi_idmap.json was not imported) and pairings "
+                     f"will be re-dealt.")
+    for r in rows:
+        k = str(int(r["charid"]))
+        _idmap[k] = int(r["content_id"])
+        if r.get("name"):
+            _charnames[k] = r["name"]
+        if r.get("world_field"):
+            _worldfields[k] = int(r["world_field"])
+        if isinstance(r.get("profile"), dict):
+            _charfields[k] = dict(r["profile"])
+    return True
+
+
+def _idmap_row(k):
+    return {"charid": int(k), "content_id": _idmap[k],
+            "name": _charnames.get(k, ""),
+            "world_field": _worldfields.get(k, 0),
+            # WARNING: NULL, not written empty, for a charid whose 0x20 has
+            # not been seen: `{}` and "never seen" have to stay
+            # distinguishable, or the lobby cannot tell an unread
+            # character from one genuinely at Job Level 0.
+            "profile": _charfields[k] if _charfields.get(k) else None,
+            "seen": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
+
+def save_idmap(*keys):
+    """Persist the in-memory map. Callers hold _idmap_lock.
+
+    With charids, writes just those rows: the row as it now stands, or a
+    delete when the charid is no longer paired. Without, the table is made
+    to hold exactly the in-memory map. Either way it is one transaction, so
+    the title plugin in the core never reads a half-written map (the file
+    this replaced had to be written to a temporary name and renamed for the
+    same reason: a reader in the truncate window parsed `{}`, served world
+    field 0, and 0 at record +0x0C is POL-0001).
+    """
+    try:
+        if keys:
+            keys = [str(k) for k in keys]
+            ffxidb.write_idmap([_idmap_row(k) for k in keys if k in _idmap],
+                               delete=[k for k in keys if k not in _idmap])
         else:
-            _idmap[str(k)] = int(v)
-
-
-def save_idmap():
-    try:
-        out = {k: {"content_id": v,
-                   "name": _charnames.get(k, ""),
-                   "world_field": _worldfields.get(k, 0),
-                   # WARNING: OMITTED, not written empty, for a charid whose 0x20 has
-                   # not been seen: `{}` and "never seen" have to stay
-                   # distinguishable, or the lobby cannot tell an unread
-                   # character from one genuinely at Job Level 0.
-                   **({"profile": _charfields[k]} if _charfields.get(k) else {}),
-                   "seen": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-               for k, v in _idmap.items()}
-        # tmp + os.replace, like save_acctmap below. The old truncate-in-place
-        # write raced responders' `_ffxi_world_fields()` mtime poll in the
-        # OTHER container: a read landing in the truncate window parsed `{}`,
-        # world_field came back 0, and 0 at record +0x0C is POL-0001. The
-        # writer bursts right after a character create -- exactly when the
-        # client re-fetches 1:3 -- so the race was synchronized by design.
-        tmp = IDMAP_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(out, fh, indent=1, sort_keys=True)
-        os.replace(tmp, IDMAP_FILE)
+            ffxidb.write_idmap([_idmap_row(k) for k in _idmap], replace=True)
     except Exception as exc:
-        log("idmap", f"could not persist {IDMAP_FILE}: {exc!r}")
+        log("idmap", f"could not persist {IDMAP_WHERE}: {exc!r}")
 
 
 def note_char_name(charid, name):
@@ -507,7 +502,7 @@ def note_char_name(charid, name):
             return
         _charnames[key] = name
         if key in _idmap:
-            save_idmap()
+            save_idmap(key)
             log("idmap", f"charid {charid} is character {name!r} "
                          f"(Content ID {_idmap[key]})")
 
@@ -529,8 +524,8 @@ def note_char_fields(charid, fields):
     player has not filled in. Nothing here is derived or defaulted.
 
     WARNING: Called for every slot of every 0x20, i.e. a few times per login. It only
-    persists when a value actually MOVED, because `save_idmap` rewrites the
-    whole file and responders polls its mtime.
+    persists when a value actually MOVED: every write is a database round
+    trip, and it makes the title plugin in the core re-read the whole map.
     """
     key = str(charid)
     fields = {k: v for k, v in (fields or {}).items() if v not in (None, "")}
@@ -542,7 +537,7 @@ def note_char_fields(charid, fields):
         was = _charfields.get(key) or {}
         _charfields[key] = fields
         if key in _idmap:
-            save_idmap()
+            save_idmap(key)
             moved = ", ".join(f"{k}={fields[k]!r}" for k in sorted(fields)
                               if was.get(k) != fields[k])
             log("idmap", f"charid {charid}: profile fields {moved} "
@@ -606,7 +601,7 @@ def note_world_field(charid, world_field):
             return
         _worldfields[key] = int(world_field)
         if key in _idmap:
-            save_idmap()
+            save_idmap(key)
             log("idmap", f"charid {charid}: world field 0x{world_field:08X} "
                          f"(POL 1:3 table[+0x04] for Content ID {_idmap[key]})")
 
@@ -681,7 +676,7 @@ def content_id_for(charid, prefer=None, member_id=None):
                 return None
             _idmap[key] = int(prefer)
             _released_ids.pop(key, None)
-            save_idmap()
+            save_idmap(key)
             log("idmap", f"charid {charid} -> Content ID {prefer} (named by the client)")
             return int(prefer)
         used = set(_idmap.values())
@@ -704,7 +699,7 @@ def content_id_for(charid, prefer=None, member_id=None):
             return None
         _idmap[key] = free[0]
         _released_ids.pop(key, None)
-        save_idmap()
+        save_idmap(key)
         log("idmap", f"charid {charid} -> Content ID {free[0]} "
                      f"({'re-paired after a failed delete' if free[0] == back else 'allocated'})")
         return free[0]
@@ -727,7 +722,7 @@ def release_charid(charid, why=""):
         if cid is None:
             return None
         _released_ids[key] = cid
-        save_idmap()
+        save_idmap(key)
     log("idmap", f"charid {charid} released Content ID {cid}"
                  + (f" -- {why}" if why else ""))
     return cid
@@ -772,9 +767,10 @@ def resign(pkt):
 # the list by then. So the identity cannot be read off the wire, and it has to
 # come from POL.
 #
-# POL publishes it already: `auth-sessions.json`, written by the core stack's
-# auth service, maps a session token to `{member_id, peer_ip, at}`. That file
-# is on the data volume this container already mounts for accounts.db.
+# POL publishes it already: the core stack's auth service keeps a session
+# table mapping a session id to `{member_id, peer_ip, at, ...}`, in the core's
+# live-state store (polcore.kv, Valkey). The bridge reads it in ONE place,
+# `pol_auth_sessions()`.
 #
 # Matching rule, in order:
 #   1. exact `peer_ip` match, most recent -- correct wherever the services see
@@ -786,8 +782,39 @@ def resign(pkt):
 #      right for sequential testing and WRONG for two clients at once; the log
 #      line is there so nobody debugs a mixed-up character list for an hour.
 # ---------------------------------------------------------------------------
-POL_SESSIONS = os.environ.get("POL_AUTH_SESSIONS",
-                              os.path.join(_HERE, os.pardir, "data", "auth-sessions.json"))
+#: The core's session table in polcore.kv: one key per session,
+#: `authsess:s:<session id>` = the session's slot as JSON, expiring with the
+#: session. It must match `_SESSION_KEY` in the core's core/lobbysession.py
+#: (tools/ffxi_idmap_check.py compares them). The slot's bytes fields are
+#: tagged `{"__b": hex}`; the bridge reads only the plain ones.
+AUTH_SESSION_KEY = "authsess:s:"
+#: Where the table is, for the log lines.
+POL_SESSIONS = f"the core's session table (kv {AUTH_SESSION_KEY}*)"
+
+
+def _session_slot(raw):
+    try:
+        ent = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return ent if isinstance(ent, dict) else None
+
+
+def pol_auth_sessions():
+    """The core's auth session table: `{session id: {member_id, peer_ip, at,
+    chars_at, viewer_open, ...}}`. Raises when the store cannot be read."""
+    store = ffxidb.kv()
+    out = {}
+    for name in store.keys(AUTH_SESSION_KEY + "*"):
+        ent = _session_slot(store.get(name))      # None: expired since the scan
+        if ent is not None:
+            out[name[len(AUTH_SESSION_KEY):]] = ent
+    return out
+
+
+def pol_auth_session(sid):
+    """One session's slot, or None. Raises when the store cannot be read."""
+    return _session_slot(ffxidb.kv().get(AUTH_SESSION_KEY + sid))
 #: How stale a POL session may be and still be taken as "the member who just
 #: pressed Play". A launch follows its login by seconds; hours later it is a
 #: guess, and a wrong guess hands someone another player's characters.
@@ -879,8 +906,7 @@ def resolve_pol_member(client_ip):
     behind NAT.
     """
     try:
-        with open(POL_SESSIONS, "r", encoding="utf-8") as fh:
-            raw = json.load(fh)
+        raw = pol_auth_sessions()
     except Exception as exc:
         log("member", f"cannot read {POL_SESSIONS} ({exc!r}); no member context")
         return None, "unreadable"
@@ -1031,11 +1057,10 @@ def resolve_pol_member(client_ip):
 #
 # One LSB account per POL member, auto-provisioned on first launch through LSB's
 # own AUTH create (`login_cmd::LOGIN_CREATE = 0x20`), so the password is bcrypted
-# by LSB rather than by us. The map is persisted because the password is
-# generated once and there is no way to recover it afterwards.
+# by LSB rather than by us. The map (the ffxi_lsb_account table) records which
+# accounts LSB has confirmed; the password is derived, never stored.
 # ---------------------------------------------------------------------------
-ACCTMAP_FILE = os.environ.get("FFXI_ACCTMAP_FILE",
-                              os.path.join(_HERE, "ffxi_accounts.json"))
+ACCTMAP_WHERE = f"table {ffxidb.ACCOUNT_TABLE}"
 #: Secret the per-member LSB password is DERIVED from. Deriving beats storing:
 #: nothing has to be persisted, a lost map costs nothing, and the file left
 #: behind carries no credential. Set it once and never rotate casually -- every
@@ -1052,11 +1077,16 @@ ACCTMAP_FILE = os.environ.get("FFXI_ACCTMAP_FILE",
 #: this password. The LSB account is machine-to-machine plumbing the player
 #: never sees, so a derived random secret is strictly better than a shared one.
 ACCT_SECRET = os.environ.get("FFXI_ACCT_SECRET", "")
+#: Only the fallback password seed, when FFXI_ACCT_SECRET is empty: it used to
+#: name the accounts.db the bridge read, and every LSB password derived without
+#: a secret depends on that string. Nothing opens this path.
+_SEED_PATH = os.environ.get("POL_ACCOUNTS_DB",
+                            os.path.join(_HERE, os.pardir, "data", "accounts.db"))
 
 
 def derive_lsb_password(member_id):
     """The LSB password for a POL member. Deterministic, never stored."""
-    seed = ACCT_SECRET or f"pol-bridge-local:{ACCOUNTS_DB}"
+    seed = ACCT_SECRET or f"pol-bridge-local:{_SEED_PATH}"
     mac = hashlib.sha256(f"{seed}\x00lsb-account\x00{int(member_id)}".encode()).digest()
     # base64url without padding: LSB stores a bcrypt hash, but keep it to
     # characters that survive a JSON round trip and any shell that touches it.
@@ -1075,37 +1105,51 @@ _acctmap = {}
 _acctmap_lock = threading.Lock()
 
 
+def _acct_key(world_tag, member_id):
+    """The in-memory key: bare member id for the primary world, `tag:id` for
+    another (see r_tag)."""
+    return f"{world_tag}:{member_id}" if world_tag else str(member_id)
+
+
 def load_acctmap():
+    """Read the account map from the database. Returns False when it could
+    not be read; the map then starts from the seed, and a member whose entry
+    is missing is recorded again on the next launch (LOGIN_CREATE answers
+    "taken" and the derived password still works)."""
     global _acctmap
     try:
-        with open(ACCTMAP_FILE, "r", encoding="utf-8") as fh:
-            _acctmap = json.load(fh)
-    except FileNotFoundError:
-        _acctmap = dict(ACCTMAP_SEED)
-        save_acctmap()
+        rows = ffxidb.load_accounts()
     except Exception as exc:
-        log("acct", f"{ACCTMAP_FILE} unreadable ({exc!r}); starting from the seed")
+        log("acct", f"{ACCTMAP_WHERE} unreadable ({exc!r}); starting from the seed")
         _acctmap = dict(ACCTMAP_SEED)
+        return False
+    _acctmap = dict(ACCTMAP_SEED)
+    for r in rows:
+        _acctmap[_acct_key(r["world_tag"], r["member_id"])] = {
+            "login": r["login"], "created": r["created"]}
+    return True
 
 
-def save_acctmap():
+def save_acctmap(key):
+    """Persist one entry of the account map (`key` as _acct_key makes it)."""
+    ent = _acctmap.get(key)
+    if ent is None:
+        return
+    tag, _, mid = key.rpartition(":")
     try:
-        tmp = ACCTMAP_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(_acctmap, fh, indent=1, sort_keys=True)
-        os.replace(tmp, ACCTMAP_FILE)
+        ffxidb.record_account(tag, int(mid), ent["login"], ent["created"])
     except Exception as exc:
-        log("acct", f"could not persist {ACCTMAP_FILE}: {exc!r}")
+        log("acct", f"could not persist {ACCTMAP_WHERE}: {exc!r}")
 
 
 def lsb_account_for(member_id):
     """(login, password) for a POL member, creating the LSB account if needed.
 
-    The password is DERIVED, not stored, so the map file is a record of which
+    The password is DERIVED, not stored, so the map is a record of which
     accounts exist rather than a credential store -- see `derive_lsb_password`.
     """
     tag = r_tag()
-    key = f"{tag}:{member_id}" if tag else str(member_id)
+    key = _acct_key(tag, member_id)
     login = f"pol{member_id}"[:16]              # accounts.login is varchar(16)
     password = derive_lsb_password(member_id)
     with _acctmap_lock:
@@ -1131,7 +1175,7 @@ def lsb_account_for(member_id):
     with _acctmap_lock:
         _acctmap[key] = {"login": login,
                          "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-        save_acctmap()
+        save_acctmap(key)
     return login, password
 
 
@@ -1409,11 +1453,9 @@ def read_poltoken(pkt):
 def member_for_sid(sid):
     """POL member behind a session id, straight from POL's own session table."""
     try:
-        with open(POL_SESSIONS, "r", encoding="utf-8") as fh:
-            raw = json.load(fh)
+        ent = pol_auth_session(sid)
     except Exception:
         return None
-    ent = raw.get(sid) if isinstance(raw, dict) else None
     if isinstance(ent, dict) and ent.get("member_id"):
         return int(ent["member_id"])
     return None
@@ -2861,7 +2903,7 @@ def do_import(dump, member_id):
     with _idmap_lock:
         _idmap[str(charid)] = free[0]
         _charnames[str(charid)] = name
-        save_idmap()
+        save_idmap(str(charid))
     log("import", f"member {member_id}: imported {name!r} as charid {charid} "
                   f"(accid {aid}), bound to Content ID {free[0]}; "
                   f"{plan['n_items']} items, {plan['n_skills']} skill rows, "
@@ -2933,20 +2975,39 @@ def http_import_server():
     srv.serve_forever()
 
 
+def wait_for_database(every=5.0):
+    """Block until the database answers and the bridge's tables exist.
+
+    Starting on an unreadable map is not a degraded mode, it is damage: the
+    first char list would pair every character afresh, and the Viewer's
+    cached pairings would no longer match (POL-0001). So the bridge does not
+    open its ports until it can read what it wrote last time.
+    """
+    while True:
+        try:
+            ffxidb.ready()
+            return
+        except Exception as exc:
+            log("boot", f"database not ready ({exc!r}); retrying in {every:.0f}s")
+            time.sleep(every)
+
+
 def main():
     global _pol_content_ids
     log("boot", f"FFXI->LSB bridge; LSB={LSB_HOST} auth={LSB_AUTH_PORT} "
                  f"view={LSB_VIEW_PORT} data={LSB_DATA_PORT}; account={LSB_ACCOUNT}")
+    wait_for_database()
     load_acctmap()
     log("boot", f"POL member -> LSB account map: "
-                f"{ {k: v['login'] for k, v in _acctmap.items()} } ({ACCTMAP_FILE}); "
+                f"{ {k: v['login'] for k, v in _acctmap.items()} } ({ACCTMAP_WHERE}); "
                 f"members resolved from {POL_SESSIONS}")
     if FFXI_ID_MAP:
         _pol_content_ids = load_pol_content_ids()
-        load_idmap()
+        while not load_idmap():
+            time.sleep(5.0)
         log("boot", f"Content-ID translation ON; POL FFXI Content IDs="
-                    f"{_pol_content_ids or 'NONE (check accounts.db)'}; "
-                    f"map={_idmap or 'empty'} ({IDMAP_FILE}); "
+                    f"{_pol_content_ids or 'NONE (check the accounts)'}; "
+                    f"map={_idmap or 'empty'} ({IDMAP_WHERE}); "
                     f"0x0B world handoff {'REWRITTEN' if MAP_HANDOFF else 'left alone'}")
     else:
         log("boot", "Content-ID translation OFF (FFXI_ID_MAP=0)")
