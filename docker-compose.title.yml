@@ -14,6 +14,10 @@
 # characters, but serves them with no world identity, and the world connect
 # fails with POL-0001.
 #
+# The plugin reads the bridge's id map from the core's own PostgreSQL database
+# (POL_DATABASE_URL, which login and authsess already have), so nothing here
+# names a file or a database.
+#
 # Stacking titles: every title image is the core image plus one plugin, so
 # to run several, build each on the previous one (OPENLOBBY_IMAGE) and list
 # them all in POL_TITLES, e.g. POL_TITLES=tmtitle,ffxititle in .env.
@@ -29,9 +33,6 @@ services:
     pull_policy: build
     environment:
       POL_TITLES: "${POL_TITLES:-ffxititle}"
-      # where the bridge writes the id map (its FFXI_IDMAP_FILE), on the
-      # shared data volume both stacks mount at /data
-      POL_FFXI_IDMAP: "${POL_FFXI_IDMAP:-/data/ffxi_idmap.json}"
       POL_FFXI_WORLD_ID: "${POL_FFXI_WORLD_ID:-0x20}"
       # FFXI Content IDs per handle, one per character (default 1; see the
       # README before raising it: eight per handle across every title)
@@ -42,6 +43,5 @@ services:
     pull_policy: never
     environment:
       POL_TITLES: "${POL_TITLES:-ffxititle}"
-      POL_FFXI_IDMAP: "${POL_FFXI_IDMAP:-/data/ffxi_idmap.json}"
       POL_FFXI_WORLD_ID: "${POL_FFXI_WORLD_ID:-0x20}"
       POL_FFXI_CHARACTER_SLOTS: "${POL_FFXI_CHARACTER_SLOTS:-}"
