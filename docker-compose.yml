@@ -237,6 +237,12 @@ services:
       # LSB soft-deletes a character and keeps its name taken; the bridge
       # renames each parked row to del<charid> so the name can be reused.
       FFXI_TOMBSTONE_DELETED: "${FFXI_TOMBSTONE_DELETED:-1}"
+      # The bridge does not open while ffxi_idmap is empty and the id map an
+      # earlier release kept (ffxi_idmap.json on the core's data volume,
+      # mounted read-only below) still holds pairings: it waits for
+      # `python ffxidb.py import idmap /data/ffxi_idmap.json`. 1 starts on
+      # the empty table anyway, which deals every character a new Content ID.
+      FFXI_IDMAP_START_EMPTY: "${FFXI_IDMAP_START_EMPTY:-}"
       # Diagnostics under /logs: raw lobby packets, and the world UDP flows
       # (one JSON line per datagram, bounded per flow and by file count).
       FFXI_PKT_DIR: /logs/pkt
@@ -281,6 +287,8 @@ services:
       - "54004:54004"          # character-import endpoint (BRIDGE_IMPORT_PORT)
     volumes:
       - bridge-logs:/logs
+      # read-only, for the old ffxi_idmap.json only (see FFXI_IDMAP_START_EMPTY)
+      - pol-data:/data:ro
     healthcheck:
       test: ["CMD", "python", "-c",
              "import socket;socket.create_connection(('127.0.0.1',54001),2).close()"]

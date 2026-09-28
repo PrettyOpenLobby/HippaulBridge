@@ -2975,6 +2975,59 @@ def http_import_server():
     srv.serve_forever()
 
 
+#: Where an earlier release kept the id map (os.pathsep separates several).
+#: The bridge mounts the core's data volume read-only at /data to see it.
+OLD_IDMAP_FILES = [p for p in os.environ.get(
+    "FFXI_OLD_IDMAP_FILE", "/data/ffxi_idmap.json").split(os.pathsep) if p]
+#: 1 lets the bridge start on an empty ffxi_idmap although an old map file
+#: with pairings is visible (the file is known to be stale, or was imported
+#: into another database on purpose).
+IDMAP_START_EMPTY = os.environ.get("FFXI_IDMAP_START_EMPTY", "").strip() == "1"
+
+
+def old_idmap_pending():
+    """(path, entries) for an old map file that holds pairings, or None.
+    Only asked while the table is empty."""
+    for path in OLD_IDMAP_FILES:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                raw = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if isinstance(raw, dict) and raw:
+            return path, len(raw)
+    return None
+
+
+def hold_for_old_idmap(every=30.0, rounds=None):
+    """Keep the bridge closed while ffxi_idmap is empty and an old map file
+    with pairings is visible. Starting then would deal every character a
+    Content ID afresh, and a character the Viewer knows under another one
+    gets POL-0001. Re-reads the table every `every` seconds, so the bridge
+    opens by itself once the file is imported. FFXI_IDMAP_START_EMPTY=1
+    skips the hold. Returns True when the bridge may open."""
+    n = 0
+    while True:
+        if _idmap or IDMAP_START_EMPTY:
+            return True
+        pending = old_idmap_pending()
+        if pending is None:
+            return True
+        path, count = pending
+        if n % 10 == 0:
+            log("idmap", f"NOT STARTING: {IDMAP_WHERE} is EMPTY but {path} holds "
+                         f"{count} pairing(s) from an earlier release. Import it "
+                         f"(python ffxidb.py import idmap {path}); the bridge "
+                         f"opens by itself once the table holds rows. "
+                         f"FFXI_IDMAP_START_EMPTY=1 starts on the empty table "
+                         f"anyway, which re-deals every Content ID.")
+        n += 1
+        if rounds is not None and n >= rounds:
+            return False
+        time.sleep(every)
+        load_idmap()
+
+
 def wait_for_database(every=5.0):
     """Block until the database answers and the bridge's tables exist.
 
@@ -3005,6 +3058,7 @@ def main():
         _pol_content_ids = load_pol_content_ids()
         while not load_idmap():
             time.sleep(5.0)
+        hold_for_old_idmap()
         log("boot", f"Content-ID translation ON; POL FFXI Content IDs="
                     f"{_pol_content_ids or 'NONE (check the accounts)'}; "
                     f"map={_idmap or 'empty'} ({IDMAP_WHERE}); "
