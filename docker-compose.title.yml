@@ -33,6 +33,9 @@ services:
       # shared data volume both stacks mount at /data
       POL_FFXI_IDMAP: "${POL_FFXI_IDMAP:-/data/ffxi_idmap.json}"
       POL_FFXI_WORLD_ID: "${POL_FFXI_WORLD_ID:-0x20}"
+      # FFXI Content IDs per handle, one per character (default 1; see the
+      # README before raising it: eight per handle across every title)
+      POL_FFXI_CHARACTER_SLOTS: "${POL_FFXI_CHARACTER_SLOTS:-}"
 
   authsess:
     image: crystalbridge-title:latest
@@ -41,3 +44,4 @@ services:
       POL_TITLES: "${POL_TITLES:-ffxititle}"
       POL_FFXI_IDMAP: "${POL_FFXI_IDMAP:-/data/ffxi_idmap.json}"
       POL_FFXI_WORLD_ID: "${POL_FFXI_WORLD_ID:-0x20}"
+      POL_FFXI_CHARACTER_SLOTS: "${POL_FFXI_CHARACTER_SLOTS:-}"

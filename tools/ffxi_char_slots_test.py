@@ -32,11 +32,15 @@ The five things below are the ones that can silently come back:
      title; the mint itself stops at that ceiling;
   5. the bridge sees the whole pool, because that is what it offers the client
      as empty character slots;
-  6. `accounts.py trim-ffxi-slots` cleans up a database written before the
+  6. `ffxititle.py trim-slots` cleans up a database written before the
      ceiling, and never deactivates an id a character is named after.
 
+The slot count is the FFXI title plugin's (`ffxititle.CHARACTER_SLOTS`, its
+`content_slots`); the core's accounts module only mints what a loaded title
+asks for. Section 1b proves that path with a count above one.
+
 Run from tools/: `python ffxi_char_slots_test.py`. Exits non-zero on failure.
-Needs the OpenLobby core's `services/` (accounts.py, responders.py): set
+Needs the OpenLobby core's `services/` (accounts.py, responders.py, titles.py): set
 OPENLOBBY_DIR to a checkout of it, or keep one beside this repository as
 ../openlobby. Without it the suite SKIPS (exit 77) rather than failing.
 """
@@ -62,6 +66,11 @@ os.environ["POL_RESOURCE_DIR"] = os.path.join(TMP, "resources")
 import accounts as A                                               # noqa: E402
 import responders as R                                             # noqa: E402
 
+LSB = os.path.join(HERE, os.pardir, "lsb")
+sys.path.insert(0, LSB)
+import ffxititle as X                                              # noqa: E402
+TITLE = X.register()          # what POL_TITLES=ffxititle does in the core
+
 FAILED = []
 
 
@@ -81,10 +90,10 @@ def fresh_db(name="accounts.db"):
 
 def ffxi_ids(db, handle_id):
     return [r["content_id"] for r in A.handle_content_list(db, handle_id)
-            if int(r["content_code"]) == A.FFXI_CONTENT_CODE]
+            if int(r["content_code"]) == X.CONTENT_CODE]
 
 
-N = A.FFXI_CHARACTER_SLOTS
+N = X.CHARACTER_SLOTS
 
 # --------------------------------------------------------------------------- #
 print("1. A NEW ACCOUNT GETS ITS FFXI CHARACTER SLOTS (want %d)" % N)
@@ -94,7 +103,7 @@ A.create_polid(db, "SLOTS1", "pw-account")
 mid = A.add_member(db, "SLOTS1", "slots-one", "pw-member")
 A.set_handle(db, mid, "Tester")
 hid = A.primary_handle_row(db, mid)["id"]
-A.grant_content(db, mid, A.FFXI_CONTENT_CODE)
+A.grant_content(db, mid, X.CONTENT_CODE)
 A.link_member_content_to_primary(db, mid)
 
 ids = ffxi_ids(db, hid)
@@ -107,7 +116,7 @@ dupes = db.execute(
 check(not dupes, "no Content ID appears twice anywhere in the DB (%s)"
       % ([dict(r) for r in dupes],))
 slots = sorted(int(r["slot"]) for r in A.handle_content_list(db, hid)
-               if int(r["content_code"]) == A.FFXI_CONTENT_CODE)
+               if int(r["content_code"]) == X.CONTENT_CODE)
 check(slots == list(range(N)), "slots are 0..%d with no gaps (%s)" % (N - 1, slots))
 
 # A title that is NOT FFXI keeps exactly one -- the slots are FFXI's rule, not a
@@ -119,11 +128,59 @@ tm = [r for r in A.handle_content_list(db, hid) if int(r["content_code"]) == 2]
 check(len(tm) == 1, "Tetra Master still gets exactly one (%d)" % len(tm))
 
 # ...and `member_content_id` must still mean slot 0, not "whichever sorted last".
-primary_id = A.member_content_id(db, mid, A.FFXI_CONTENT_CODE)
+primary_id = A.member_content_id(db, mid, X.CONTENT_CODE)
 slot0 = [r["content_id"] for r in A.handle_content_list(db, hid)
-         if int(r["content_code"]) == A.FFXI_CONTENT_CODE and int(r["slot"]) == 0]
+         if int(r["content_code"]) == X.CONTENT_CODE and int(r["slot"]) == 0]
 check(primary_id == slot0[0],
       "member_content_id returns slot 0 (%s vs %s)" % (primary_id, slot0[0]))
+
+# --------------------------------------------------------------------------- #
+print()
+print("1b. THE TITLE'S SLOT COUNT IS WHAT THE ACCOUNT DATABASE MINTS")
+
+# With the default of one, every check above would pass with the slot code
+# deleted outright. Raise the plugin's count for this section so the mint,
+# the per-title rule and the login top-up each have something to prove.
+check(A.content_slots_for(X.CONTENT_CODE) == N,
+      "accounts reads the plugin's count (%d)" % A.content_slots_for(X.CONTENT_CODE))
+db1 = fresh_db("hook.db")
+A.create_polid(db1, "HOOK", "pw-account")
+hm = A.add_member(db1, "HOOK", "hook", "pw-member")
+A.set_handle(db1, hm, "Hooked")
+hh = A.primary_handle_row(db1, hm)["id"]
+A.grant_content(db1, hm, X.CONTENT_CODE)
+A.link_member_content_to_primary(db1, hm)
+check(len(ffxi_ids(db1, hh)) == N,
+      "before the raise the handle holds %d (%d)" % (N, len(ffxi_ids(db1, hh))))
+TITLE.content_slots = 3
+try:
+    got = A.ensure_title_slots(db1, member_id=hm)     # what a login runs
+    check(got == 3 - N and len(ffxi_ids(db1, hh)) == 3,
+          "the login top-up raises it to the plugin's 3 (%d minted)" % got)
+    check(A.ensure_title_slots(db1, member_id=hm) == 0,
+          "...and a second login mints nothing")
+    A.grant_content(db1, hm, 2)
+    A.link_member_content_to_primary(db1, hm)
+    check(len([r for r in A.handle_content_list(db1, hh)
+               if int(r["content_code"]) == 2]) == 1,
+          "a title whose plugin asks for nothing still gets one")
+    A.create_polid(db1, "HOOK2", "pw-account")
+    pm = A.add_member(db1, "HOOK2", "hook-two", "pw-member")
+    A.set_handle(db1, pm, "Placed")
+    ph = A.primary_handle_row(db1, pm)["id"]
+    A.grant_content(db1, pm, X.CONTENT_CODE)
+    A.link_member_content_to_primary(db1, pm)       # a redeemed code
+    check(len(ffxi_ids(db1, ph)) == 3,
+          "placing the title mints the plugin's 3 (%d)" % len(ffxi_ids(db1, ph)))
+    reg = A.register_account(db1, "Hookreg", "password123", contents=(1, 2))
+    rh = db1.execute("SELECT id FROM handle WHERE member_id = ?",
+                     (reg["member_id"],)).fetchone()["id"]
+    check(len(ffxi_ids(db1, rh)) == 3,
+          "registration mints the plugin's 3 in its one transaction (%d)"
+          % len(ffxi_ids(db1, rh)))
+finally:
+    TITLE.content_slots = X.CHARACTER_SLOTS
+db1.close()
 
 # --------------------------------------------------------------------------- #
 print()
@@ -179,7 +236,7 @@ kept = db2.execute("SELECT COUNT(*) n FROM handle_content_pre_slots").fetchone()
 check(int(kept) == 2, "the pre-migration rows are kept for recovery (%s)" % (kept,))
 
 # Idempotent: running it again must not mint a second set.
-again = A.ensure_ffxi_character_slots(db2)
+again = A.ensure_title_slots(db2)
 check(again == 0, "a second top-up mints nothing (%s)" % (again,))
 check(len(ffxi_ids(db2, 1)) == N, "...and the count is unchanged")
 
@@ -187,7 +244,7 @@ check(len(ffxi_ids(db2, 1)) == N, "...and the count is unchanged")
 # this must not hand the title to everybody.
 db2.execute("INSERT INTO handle VALUES (2, 1, 'NoFFXI', 0, '2026-08-01T00:00:00Z', 0)")
 db2.commit()
-A.ensure_ffxi_character_slots(db2)
+A.ensure_title_slots(db2)
 check(not ffxi_ids(db2, 2), "a handle without FFXI is not given any")
 
 # --------------------------------------------------------------------------- #
@@ -203,7 +260,7 @@ A.create_polid(db3, "MOVE", "pw-account")
 mm = A.add_member(db3, "MOVE", "mover", "pw-member")
 A.set_handle(db3, mm, "First")
 h1 = A.primary_handle_row(db3, mm)["id"]
-A.grant_content(db3, mm, A.FFXI_CONTENT_CODE)
+A.grant_content(db3, mm, X.CONTENT_CODE)
 A.link_member_content_to_primary(db3, mm)
 before_ids = set(ffxi_ids(db3, h1))
 check(len(before_ids) == N, "the source handle holds %d (%s)"
@@ -213,14 +270,14 @@ db3.execute("INSERT INTO handle (member_id, handle_name, is_primary, created_at,
             " client_guid) VALUES (?,?,0,?,0)", (mm, "Second", "2026-09-03T00:00:00Z"))
 db3.commit()
 h2 = db3.execute("SELECT id FROM handle WHERE handle_name = 'Second'").fetchone()["id"]
-A.link_content_to_handle(db3, h2, A.FFXI_CONTENT_CODE)
+A.link_content_to_handle(db3, h2, X.CONTENT_CODE)
 
 moved = set(ffxi_ids(db3, h2))
 check(moved == before_ids,
       "every Content ID moved, none lost or re-minted (%s)" % (sorted(moved),))
 check(not ffxi_ids(db3, h1), "...and none was left behind on the source handle")
 moved_slots = sorted(int(r["slot"]) for r in A.handle_content_list(db3, h2)
-                     if int(r["content_code"]) == A.FFXI_CONTENT_CODE)
+                     if int(r["content_code"]) == X.CONTENT_CODE)
 check(moved_slots == list(range(N)),
       "slots renumbered without a gap (%s)" % (moved_slots,))
 dupes3 = db3.execute(
@@ -293,7 +350,7 @@ fhid = A.primary_handle_row(full, fmid)["id"]
 for code in (1, 2, 3, 4, 10, 11, 14, 15):
     A.grant_content(full, fmid, code)
 A.link_member_content_to_primary(full, fmid)
-minted = A.ensure_content_slots(full, fhid, A.FFXI_CONTENT_CODE, 4)
+minted = A.ensure_content_slots(full, fhid, X.CONTENT_CODE, 4)
 check(minted == 0, "4c. a fully granted handle mints no extra slot (%d)" % minted)
 check(A.handle_link_count(full, fhid) <= A.CONTENT_IDS_PER_HANDLE,
       "...and holds at most %d Content IDs (%d)"
@@ -304,19 +361,19 @@ A.create_polid(room, "ROOM", "pw-account")
 rmid = A.add_member(room, "ROOM", "room", "pw-member")
 A.set_handle(room, rmid, "Roomy")
 rhid = A.primary_handle_row(room, rmid)["id"]
-A.grant_content(room, rmid, A.FFXI_CONTENT_CODE)
+A.grant_content(room, rmid, X.CONTENT_CODE)
 A.link_member_content_to_primary(room, rmid)
-got = A.ensure_content_slots(room, rhid, A.FFXI_CONTENT_CODE, 4)
+got = A.ensure_content_slots(room, rhid, X.CONTENT_CODE, 4)
 check(got == 3 and A.handle_link_count(room, rhid) == 4,
       "4d. a handle holding only FFXI can still be raised to four (%d minted)" % got)
 
 # The record encoder still has to be able to say both things -- `bind` is what
 # 4b reads -- even though `_db_chars` now only ever passes True.
-bound = R._char_record(REC, 0, 0, 0, A.FFXI_CONTENT_CODE, "30000037", bind=True)
-unbound = R._char_record(REC, 9, 0, 9, A.FFXI_CONTENT_CODE, "30000099", bind=False)
+bound = R._char_record(REC, 0, 0, 0, X.CONTENT_CODE, "30000037", bind=True)
+unbound = R._char_record(REC, 9, 0, 9, X.CONTENT_CODE, "30000099", bind=False)
 check(bound[0x04] == 1, "a bound record sets the bind flag (+0x04 = %d)" % bound[0x04])
 check(unbound[0x04] == 0, "an unbound record clears it (+0x04 = %d)" % unbound[0x04])
-check(struct.unpack_from("<H", bound, 0x08)[0] == A.FFXI_CONTENT_CODE,
+check(struct.unpack_from("<H", bound, 0x08)[0] == X.CONTENT_CODE,
       "a served record carries its content code (the launch gate's field)")
 check(struct.unpack_from("<I", bound, 0x10)[0] == 30000037,
       "...and the Content ID FFXI's world lookup compares")
@@ -367,7 +424,7 @@ check(len(free) == 1,
 print()
 print("6. THE OPERATOR COMMAND THAT CLEANS UP EXISTING ACCOUNTS")
 
-# `trim-ffxi-slots` is what an operator runs on a database that was written
+# `ffxititle.py trim-slots` is what an operator runs on a database that was written
 # BEFORE the ceiling was enforced -- the rows are still there, and the bridge
 # still offers them as empty character slots even though the wire drops them.
 # The whole risk of the command is in one place: deactivating an id a character
@@ -397,8 +454,12 @@ json.dump({"7": {"content_id": int(extras[0]), "name": "Ayla", "world_field": 1}
 
 
 def trim(*argv):
-    r = subprocess.run([sys.executable, "accounts.py", CLI_DB] + list(argv),
-                       cwd=SERVICES, capture_output=True, text=True)
+    # The plugin sits beside the core's modules in the title image; here the
+    # core's services/ goes on the path the same way.
+    env = dict(os.environ, PYTHONPATH=SERVICES)
+    r = subprocess.run([sys.executable, os.path.join(LSB, "ffxititle.py"), CLI_DB,
+                        "trim-slots"] + list(argv),
+                       cwd=SERVICES, env=env, capture_output=True, text=True)
     return r.returncode, r.stdout + r.stderr
 
 
@@ -412,7 +473,7 @@ def active_extras():
         db.close()
 
 
-rc, out = trim("trim-ffxi-slots", "--idmap", IDMAP)
+rc, out = trim("--idmap", IDMAP)
 check(rc == 0 and active_extras() == 3,
       "6a. the default is a REPORT and writes nothing (rc %d, %d active)"
       % (rc, active_extras()))
@@ -421,14 +482,14 @@ check("Ayla IS ON THIS ID" in out,
 
 # 6b. THE ONE THAT MATTERS. No id map = no way to know what is in use, so the
 # command must not guess. An empty map must never read as "nothing is in use".
-rc, out = trim("trim-ffxi-slots", "--apply", "--idmap", os.path.join(TMP, "gone.json"))
+rc, out = trim("--apply", "--idmap", os.path.join(TMP, "gone.json"))
 check(rc != 0 and "REFUSING" in out and active_extras() == 3,
       "6b. --apply REFUSES when the id map cannot be read (rc %d, %d active)"
       % (rc, active_extras()))
 check(all(ord(ch) < 127 for ch in out),
       "...and says so in ASCII, which a cp1252 console can actually print")
 
-rc, out = trim("trim-ffxi-slots", "--apply", "--idmap", IDMAP)
+rc, out = trim("--apply", "--idmap", IDMAP)
 check(rc == 0 and active_extras() == 1,
       "6c. --apply trims the free ids and KEEPS the one with a character on it"
       " (%d left)" % active_extras())
@@ -445,7 +506,7 @@ check(len(after) <= R._CHAR_PER_HANDLE and all(rec[4] for rec in after),
       % len(after))
 os.environ["POL_ACCOUNTS_DB"] = os.path.join(TMP, "accounts.db")
 
-rc, out = trim("trim-ffxi-slots", "--restore")
+rc, out = trim("--restore")
 check(rc == 0 and active_extras() == 3,
       "6d. --restore puts back exactly what it deactivated (%d active)"
       % active_extras())
@@ -453,7 +514,7 @@ check(rc == 0 and active_extras() == 3,
 # The bridge has written two map shapes over its life and the in-use check has
 # to understand both, or it reports a live character's id as free.
 json.dump({"7": int(extras[0])}, io.open(IDMAP, "w", encoding="utf-8"))
-rc, out = trim("trim-ffxi-slots", "--idmap", IDMAP)
+rc, out = trim("--idmap", IDMAP)
 check(rc == 0 and "IS ON THIS ID" in out,
       "6e. the flat legacy id map shape is still understood")
 
