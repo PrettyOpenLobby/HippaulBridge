@@ -19,7 +19,21 @@ bridge module itself still loads without the core.
 
     python ffxidb.py migrate      apply what is pending (uses POL_DATABASE_URL)
     python ffxidb.py status       list this repository's migrations
+    python ffxidb.py import idmap FILE [--merge] [--dry-run]
+    python ffxidb.py import accounts FILE [--merge] [--dry-run]
+
+`import` moves a map an earlier release kept as a file into its table:
+`idmap` reads ffxi_idmap.json (on the core's data volume) into ffxi_idmap,
+`accounts` reads ffxi_accounts.json (on the bridge's old state volume) into
+ffxi_lsb_account. The file is only read. The import runs in one transaction
+and refuses a table that already holds rows (exit 2) unless --merge is given,
+which adds only the keys the table lacks. A second run finds nothing to add
+and changes nothing. --dry-run prints the same report and writes nothing.
+Entries it cannot map are listed and skipped. Import the id map before the
+bridge first starts on this database: a bridge on an empty map deals every
+character a Content ID afresh.
 """
+import datetime
 import importlib
 import json
 import os
@@ -210,7 +224,244 @@ def record_account(world_tag, member_id, login, created):
               key=("world_tag", "member_id"))
 
 
+# --------------------------------------------------------------------------- #
+# importing the files an earlier release kept
+# --------------------------------------------------------------------------- #
+class ImportRefused(RuntimeError):
+    """The source cannot be read as the file it should be."""
+
+
+class _Rollback(Exception):
+    pass
+
+
+def _iso_mtime(path):
+    return datetime.datetime.fromtimestamp(
+        os.path.getmtime(path), datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _read_json_object(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except OSError as exc:
+        raise ImportRefused(f"cannot read {path}: {exc}") from None
+    except ValueError as exc:
+        raise ImportRefused(f"{path} is not JSON: {exc}") from None
+    if not isinstance(data, dict):
+        raise ImportRefused(f"{path} holds a {type(data).__name__}, "
+                            "not the JSON object the bridge wrote")
+    return data
+
+
+def _int(value, what):
+    if isinstance(value, bool) or value is None:
+        raise ValueError(f"{what} is {value!r}")
+    if isinstance(value, int):
+        out = value
+    elif isinstance(value, str) and value.strip().lstrip("-").isdigit():
+        out = int(value.strip())
+    else:
+        raise ValueError(f"{what} is {value!r}, not a whole number")
+    if not -(1 << 63) <= out < (1 << 63):
+        raise ValueError(f"{what} {out} does not fit a BIGINT")
+    return out
+
+
+def _text(value, what):
+    if not isinstance(value, str):
+        raise ValueError(f"{what} is {value!r}, not text")
+    if "\x00" in value:
+        raise ValueError(f"{what} holds a NUL character")
+    return value
+
+
+def read_old_idmap(path):
+    """(rows, skipped) from an old ffxi_idmap.json. Both shapes the bridge
+    wrote are read: `{charid: content_id}` (the first) and `{charid:
+    {content_id, name, world_field, profile, seen}}`. A flat entry gets name
+    '' and world_field 0, which mean "not seen yet"; an entry with no profile
+    gets NULL, which the profile keeps apart from real zeros. An entry with no
+    `seen` gets the file's modification time."""
+    raw = _read_json_object(path)
+    stamp = _iso_mtime(path)
+    rows, skipped = [], []
+    for key, ent in raw.items():
+        try:
+            charid = _int(key, "the charid")
+            if isinstance(ent, dict):
+                if "content_id" not in ent:
+                    raise ValueError("no content_id")
+                profile = ent.get("profile")
+                if profile is not None and not isinstance(profile, dict):
+                    raise ValueError(f"the profile is {profile!r}, not an object")
+                row = {"charid": charid,
+                       "content_id": _int(ent["content_id"], "the content_id"),
+                       "name": _text(ent.get("name") or "", "the name"),
+                       "world_field": _int(ent.get("world_field") or 0,
+                                           "the world_field"),
+                       "profile": profile,
+                       "seen": _text(ent.get("seen") or stamp, "seen")}
+            else:
+                row = {"charid": charid,
+                       "content_id": _int(ent, "the content_id"),
+                       "name": "", "world_field": 0, "profile": None,
+                       "seen": stamp}
+        except ValueError as exc:
+            skipped.append((key, str(exc)))
+            continue
+        rows.append(row)
+    return rows, skipped
+
+
+def read_old_accounts(path):
+    """(rows, skipped) from an old ffxi_accounts.json, `{key: {login,
+    created}}`. A bare member id is the primary world ("5" -> ('', 5)), and
+    `tag:id` another ("alt:5" -> ('alt', 5))."""
+    raw = _read_json_object(path)
+    rows, skipped = [], []
+    for key, ent in raw.items():
+        try:
+            tag, _, mid = str(key).rpartition(":")
+            if not isinstance(ent, dict):
+                raise ValueError(f"the entry is {ent!r}, not an object")
+            rows.append({"world_tag": _text(tag, "the world tag"),
+                         "member_id": _int(mid, "the member id"),
+                         "login": _text(ent.get("login"), "the login"),
+                         "created": _text(ent.get("created"), "created")})
+        except ValueError as exc:
+            skipped.append((key, str(exc)))
+    return rows, skipped
+
+
+#: store -> (table, key columns, columns, JSONB columns, reader)
+IMPORTS = {
+    "idmap": (IDMAP_TABLE, ("charid",),
+              ("charid", "content_id", "name", "world_field", "profile", "seen"),
+              ("profile",), read_old_idmap),
+    "accounts": (ACCOUNT_TABLE, ("world_tag", "member_id"),
+                 ("world_tag", "member_id", "login", "created"), (),
+                 read_old_accounts),
+}
+
+#: What an existing row is compared on: `seen` and `created` are stamps, and a
+#: row that differs only there is the same pairing.
+_COMPARE_SKIP = {"seen", "created"}
+
+
+def import_file(store, path, merge=False, dry_run=False, out=print):
+    """Import one old file. Returns the exit status: 0 done, nothing to do or
+    dry run; 1 the source or the database failed; 2 refused, the table
+    already holds rows and the source has rows it lacks (without --merge)."""
+    table, key, cols, jsonb, reader = IMPORTS[store]
+    try:
+        rows, skipped = reader(path)
+    except ImportRefused as exc:
+        out(f"error: {exc}")
+        return 1
+    pg = db()
+    out(f"import {store}: {path} -> {table}")
+    out(f"  entries in the file   {len(rows) + len(skipped)}")
+    for k, why in skipped:
+        out(f"  skipped {k!r}: {why}")
+    if not dry_run:
+        ready()
+    kidx = lambda r: tuple(r[c] for c in key)          # noqa: E731
+    result = {}
+    try:
+        with pg.transaction(lock="crystalbridge.import:" + table) as conn:
+            exists = conn.execute("SELECT to_regclass(%s) IS NOT NULL AS ok",
+                                  (table,)).fetchone()["ok"]
+            have = {}
+            if exists:
+                for r in conn.execute("SELECT %s FROM %s" % (", ".join(cols), table)):
+                    have[kidx(r)] = r
+            elif not dry_run:
+                raise RuntimeError(f"{table} does not exist after the migrations")
+            new, same, differs, seen, dups = [], 0, [], set(), 0
+            for r in rows:
+                k = kidx(r)
+                if k in seen:
+                    dups += 1
+                    continue
+                seen.add(k)
+                if k not in have:
+                    new.append(r)
+                elif all(have[k][c] == r[c] for c in cols if c not in _COMPARE_SKIP):
+                    same += 1
+                else:
+                    differs.append(k)
+            out(f"  in the table before   {len(have)}"
+                + ("" if exists else " (the table does not exist yet)"))
+            if dups:
+                out(f"  skipped, key repeated  {dups}")
+            out(f"  already there         {same + len(differs)}")
+            for k in differs:
+                out(f"  kept the table's row, the file's differs: {k}")
+            out(f"  to insert             {len(new)}")
+            result.update(new=new)
+            if new and have and not merge:
+                result["status"] = "refused"
+                raise _Rollback()
+            if dry_run:
+                result["status"] = "dry-run"
+                raise _Rollback()
+            n = 0
+            for r in new:
+                n += conn.execute(
+                    "INSERT INTO %s (%s) VALUES (%s) ON CONFLICT DO NOTHING"
+                    % (table, ", ".join(cols),
+                       ", ".join("%s::jsonb" if c in jsonb else "%s" for c in cols)),
+                    [json.dumps(r[c], sort_keys=True)
+                     if c in jsonb and r[c] is not None else r[c]
+                     for c in cols]).rowcount
+            result.update(status="done" if n else "nothing", inserted=n)
+    except _Rollback:
+        pass
+    except pg.Error as exc:
+        out(f"FAILED, rolled back: {exc}")
+        return 1
+    status = result["status"]
+    if status == "refused":
+        out(f"REFUSED: {table} already holds rows. Nothing was written. Run "
+            "again with --merge to add only the keys it lacks.")
+        return 2
+    if status == "dry-run":
+        out("Dry run: nothing was written.")
+    elif status == "nothing":
+        out(f"Nothing to import: {table} already holds every entry. "
+            "Nothing was changed.")
+    else:
+        out(f"Done: {result['inserted']} row(s) written.")
+    return 0
+
+
+def _import_main(argv):
+    import argparse
+    ap = argparse.ArgumentParser(prog="python ffxidb.py import",
+                                 description="Import a map an earlier release "
+                                 "kept as a file (uses POL_DATABASE_URL).")
+    ap.add_argument("store", choices=sorted(IMPORTS))
+    ap.add_argument("file")
+    ap.add_argument("--merge", action="store_true",
+                    help="add only the keys the table lacks")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="report what would be imported; write nothing")
+    args = ap.parse_args(argv)
+    pg = db()
+    try:
+        return import_file(args.store, args.file, merge=args.merge,
+                           dry_run=args.dry_run)
+    except (pg.DatabaseNotConfigured, pg.MigrationError, pg.Error) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        pg.close()
+
+
 def _main(argv):
+    if argv and argv[0] == "import":
+        return _import_main(argv[1:])
     import argparse
     ap = argparse.ArgumentParser(prog="python ffxidb.py",
                                  description="CrystalBridge's migrations "
