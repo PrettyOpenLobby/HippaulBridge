@@ -1,4 +1,4 @@
-# CrystalBridge: a LandSandBoat (FFXI) world server plus the bridge that lets a
+# HippaulBridge: a LandSandBoat (FFXI) world server plus the bridge that lets a
 # PlayOnline Viewer's FFXI launch land in it. This file is an OVERRIDE of
 # OpenLobby's compose file, not a stack of its own: everything here runs in
 # OpenLobby's compose project, beside the core, on its network, and the bridge
@@ -193,11 +193,11 @@ services:
   # the ports the client actually dials.
   bridge:
     build:
-      context: ../crystalbridge/lsb
+      context: ../hippaulbridge/lsb
       dockerfile: Dockerfile.bridge
       args:
         OPENLOBBY_IMAGE: "${OPENLOBBY_IMAGE:-openlobby:latest}"
-    image: crystalbridge:latest
+    image: hippaulbridge:latest
     pull_policy: build
     environment:
       LSB_HOST: connect
@@ -218,7 +218,7 @@ services:
       # accounts (which members hold which FFXI Content IDs) are read through
       # the core's accounts module; the bridge's own state, the Content ID map
       # the core's login service reads back and the member -> LSB account map,
-      # is in CrystalBridge's ffxi_* tables (lsb/ffxi_migrations/), which the
+      # is in HippaulBridge's ffxi_* tables (lsb/ffxi_migrations/), which the
       # bridge creates at start. Which member is signed in from where is the
       # core's session table in Valkey.
       POL_DATABASE_URL: "postgresql://openlobby:${POL_DB_PASSWORD:-openlobby}@postgres:5432/openlobby"
@@ -307,8 +307,9 @@ services:
       valkey:
         condition: service_healthy
 
-# These keep the names they had when this was a compose project of its own,
-# so the LSB database and the logs carry over.
+# These keep the names they had when this was a compose project of its own
+# (and from before CrystalBridge became HippaulBridge), so the LSB database and
+# the logs carry over. Do not rename them: a renamed volume orphans its data.
 volumes:
   lsb-db:
     name: crystalbridge_lsb-db

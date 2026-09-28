@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir pymysql
 WORKDIR /app
 COPY ffxi_bridge.py /app/ffxi_bridge.py
 COPY ffxi_import_core.py /app/ffxi_import_core.py
-# The bridge's tables: the database plumbing and CrystalBridge's migrations
+# The bridge's tables: the database plumbing and HippaulBridge's migrations
 # (6001-6999), applied by the bridge when it starts.
 COPY ffxidb.py /app/ffxidb.py
 COPY ffxi_migrations /app/ffxi_migrations
