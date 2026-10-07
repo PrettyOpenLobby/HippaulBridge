@@ -508,6 +508,143 @@ check(rc == 0 and "charid 7 IS ON THIS ID" in out,
 
 # --------------------------------------------------------------------------- #
 print()
+print("7. THE PROFILE CARD NAMES A GAME ONCE, NOT ONCE PER CHARACTER")
+
+# A handle with several FFXI characters (several Content IDs under one code)
+# still shows the game exactly once on the identity card -- the separate
+# characters live on the title's own select screen (the 1:3 list `_db_chars`
+# builds), not as repeated rows here. Before the collapse the card listed a game
+# once per Content ID.
+import struct                                                      # noqa: E402
+card = fresh_db("card")
+A.create_polid(card, "CARD", "pw-account")
+cmid = A.add_member(card, "CARD", "card", "pw-member")
+A.set_handle(card, cmid, "Carder")
+chid7 = A.primary_handle_row(card, cmid)["id"]
+for code in (1, 2, 3):                        # FFXI + Tetra Master + content 3
+    A.grant_content(card, cmid, code)
+A.link_member_content_to_primary(card, cmid)
+A.ensure_content_slots(card, chid7, X.CONTENT_CODE, 3)    # FFXI x3
+card.commit()
+check(len(ffxi_ids(card, chid7)) == 3,
+      "the handle holds 3 FFXI Content IDs (%d)" % len(ffxi_ids(card, chid7)))
+use_db("card")
+
+
+def card_codes(buf):
+    out = []
+    for k in range(R._IDREC_CONTENT_MAX):
+        present, f02, ctsid, cid = struct.unpack_from(
+            "<HHII", buf, k * R._IDREC_CONTENT_STRIDE)
+        if present or f02 or ctsid or cid:
+            out.append(f02)
+    return out
+
+
+codes7 = card_codes(R._identity_content_entries(A.connect(_DBS["card"]), chid7))
+check(codes7.count(X.CONTENT_CODE) == 1,
+      "7a. FFXI appears exactly once on the card (%s)" % (codes7,))
+check(sorted(codes7) == [1, 2, 3],
+      "7b. each owned game appears once -- none lost, none doubled (%s)" % (codes7,))
+
+# --------------------------------------------------------------------------- #
+print()
+print("8. EXTRA CHARACTER SLOTS NEVER CROWD OUT A TITLE THE MEMBER OWNS")
+
+# `safe_slot_target` reserves one binding position per title the member owns but
+# has not placed yet, so raising a title's slot count cannot evict a character
+# once the other titles are placed. It only
+# bites above a count of one, so at the default this proves the guard.
+res = fresh_db("reserve")
+A.create_polid(res, "RESV", "pw-account")
+rmid8 = A.add_member(res, "RESV", "resv", "pw-member")
+A.set_handle(res, rmid8, "Reserver")
+rhid8 = A.primary_handle_row(res, rmid8)["id"]
+for code in (1, 2, 3, 4, 10, 11):             # owns six titles
+    A.grant_content(res, rmid8, code)
+res.execute("INSERT INTO handle_content (handle_id, content_code, slot,"
+            " content_id, status, linked_at) VALUES (%s,%s,0,%s,'active',%s)",
+            (rhid8, X.CONTENT_CODE, "30008000", "2026-10-03T00:00:00Z"))
+res.commit()                                  # place ONLY FFXI; five titles unplaced
+tgt8 = A.safe_slot_target(res, rhid8, X.CONTENT_CODE, 4, rmid8)
+check(tgt8 == 3, "8a. five unplaced titles reserve five positions, want 4 -> 3 (%d)"
+      % tgt8)
+
+solo = fresh_db("solo")
+A.create_polid(solo, "SOLO", "pw-account")
+smid = A.add_member(solo, "SOLO", "solo", "pw-member")
+A.set_handle(solo, smid, "Solo")
+shid = A.primary_handle_row(solo, smid)["id"]
+A.grant_content(solo, smid, X.CONTENT_CODE)   # owns only FFXI
+solo.execute("INSERT INTO handle_content (handle_id, content_code, slot,"
+             " content_id, status, linked_at) VALUES (%s,%s,0,%s,'active',%s)",
+             (shid, X.CONTENT_CODE, "30008100", "2026-10-03T00:00:00Z"))
+solo.commit()
+tgt8b = A.safe_slot_target(solo, shid, X.CONTENT_CODE, 4, smid)
+check(tgt8b == 4, "8b. a handle owning only FFXI keeps the full four (%d)" % tgt8b)
+
+# End to end: a bundled six-title sign-up with the plugin raised to four never
+# exceeds the ceiling and loses no title.
+TITLE.content_slots = 4
+try:
+    e2e = fresh_db("e2e")
+    acct8 = A.register_account(e2e, "SixTitles", "password123",
+                               contents=(1, 2, 3, 4, 10, 11))
+    ehid = e2e.execute("SELECT id FROM handle WHERE member_id = %s",
+                       (acct8["member_id"],)).fetchone()["id"]
+    total8 = A.handle_link_count(e2e, ehid)
+    codes8 = {int(r["content_code"]) for r in A.handle_content_list(e2e, ehid)}
+    check(total8 <= A.CONTENT_IDS_PER_HANDLE,
+          "8c. a bundled sign-up never exceeds %d Content IDs (%d)"
+          % (A.CONTENT_IDS_PER_HANDLE, total8))
+    check(codes8 >= {1, 2, 3, 4, 10, 11},
+          "...and every owned title kept a binding position (%s)" % (sorted(codes8),))
+finally:
+    TITLE.content_slots = X.CHARACTER_SLOTS
+
+# --------------------------------------------------------------------------- #
+print()
+print("9. OVER THE CEILING, AN EMPTY CREATE SLOT IS DROPPED, NEVER A CHARACTER")
+
+# A title granted after the extra slots were minted pushes a handle past eight.
+# The wire carries only eight, so one slot falls off -- and it must be an unused
+# create slot, never one a character sits on. The old order dropped the highest
+# slot; here the character is ON the highest slot, so the old order would have
+# stranded it.
+nine = fresh_db("ninth")
+nacct = A.register_account(nine, "NinthChar", "password123",
+                           contents=(1, 2, 3, 4, 10, 11))
+nhid = nine.execute("SELECT id FROM handle WHERE member_id = %s",
+                    (nacct["member_id"],)).fetchone()["id"]
+for slot, cid in ((1, "30009001"), (2, "30009002"), (3, "30009003")):
+    nine.execute("INSERT INTO handle_content (handle_id, content_code, slot,"
+                 " content_id, status, linked_at) VALUES (%s,1,%s,%s,'active',%s)",
+                 (nhid, slot, cid, "2026-10-03T00:00:00Z"))
+nine.commit()
+check(A.handle_link_count(nine, nhid) == 9,
+      "the handle is one over the ceiling (%d links)" % A.handle_link_count(nine, nhid))
+use_db("ninth")
+# the bridge id map says a CHARACTER sits on the HIGHEST extra slot (30009003)
+ffxidb.write_idmap([{"charid": 42, "content_id": 30009003, "name": "Casdeck",
+                     "world_field": 1, "seen": "2026-10-03T00:00:00Z"}], replace=True)
+# the plugin caches the id map by a per-database change counter; this suite
+# hops between fresh databases, so drop the cache to force a read of THIS one
+# (a live server has one database and the counter only ever moves forward).
+X._cache["rev"] = None
+served9 = R._db_chars()
+served_ids = {rec[3] for rec in served9}
+served_codes = {rec[2] for rec in served9}
+check(len(served9) == R._CHAR_PER_HANDLE,
+      "9a. the wire carries exactly %d records (%d)" % (R._CHAR_PER_HANDLE, len(served9)))
+check("30009003" in served_ids,
+      "9b. the character's Content ID survived, not the old highest-slot drop (%s)"
+      % (sorted(served_ids),))
+check(served_codes >= {1, 2, 3, 4, 10, 11},
+      "9c. every title kept its binding position (%s)" % (sorted(served_codes),))
+check(all(rec[4] for rec in served9), "9d. every served record is bound")
+
+# --------------------------------------------------------------------------- #
+print()
 if FAILED:
     print("RESULT: %d FAILURE(S)" % len(FAILED))
     for f in FAILED:

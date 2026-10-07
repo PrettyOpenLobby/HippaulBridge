@@ -161,7 +161,7 @@ def advertise_ip_for(client_ip):
             return packed, text
     return None, None
 
-XILOADER_VER   = [2, 1, 0]
+XILOADER_VER   = [2, 2, 0]
 
 # --- ROUTE BY REPORTED CLIENT VERSION ---------------------------------------
 #
@@ -310,6 +310,23 @@ PKT_DUMP     = os.environ.get("FFXI_PKT_DUMP", "1") == "1"
 _HERE        = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 import ffxidb  # noqa: E402  (imports nothing from the core until called)
+import ffxi_gmcalls  # noqa: E402  (in-game GM calls <-> the core's GM desk)
+import ffxi_federation  # noqa: E402  (our members on other operators' worlds)
+#: The remote worlds and our provider identity (ffxi_federation.Federation), or None:
+#: federation is OFF unless FFXI_FED_WORLDS names a world. Set in main(), and again by
+#: reload_federation() when the admin tool (ffxi_fedtool.py) edits the world list.
+FED = None
+#: Our own world's name, learned from LSB's 0x23. A remote world may never be shown under
+#: it: the client names the chosen world on a create by NAME (fed_c2s, 0x22).
+_world_name = ""
+
+
+def reload_federation():
+    """Re-read FFXI_FED_WORLDS and the provider keys (the admin tool calls this after an
+    edit). The swap is one assignment; a request in flight keeps the object it started with."""
+    global FED
+    FED = ffxi_federation.Federation.from_env() if FFXI_ID_MAP else None
+    return FED
 #: Where the id map lives, for the log lines.
 IDMAP_WHERE  = f"table {ffxidb.IDMAP_TABLE}"
 PKT_DIR      = os.environ.get("FFXI_PKT_DIR",
@@ -926,7 +943,13 @@ def resolve_pol_member(client_ip):
             continue
         chars_at = float(ent.get("chars_at") or 0)
         peer = _norm_ip(ent.get("peer_ip"))
-        signed_in = bool(ent.get("viewer_open"))
+        # `viewer_open` outlives a Viewer that never signed out cleanly, so on
+        # its own it keeps ghosts "signed in" for hours. `channel_open` is
+        # cleared whenever POL closes the session channel, so an explicit False
+        # means that Viewer is gone (2026-10-01: seven such ghosts on one
+        # address outranked the two live sessions and served the wrong list).
+        signed_in = (bool(ent.get("viewer_open"))
+                     and ent.get("channel_open") is not False)
         if REQUIRE_SAME_ADDRESS and peer != client_ip:
             # Another address is another player. Never a candidate.
             elsewhere.append(f"member {ent['member_id']} @ {peer or '?'}"
@@ -945,7 +968,9 @@ def resolve_pol_member(client_ip):
                           f"{' ...' if len(elsewhere) > 8 else ''}")
             return None, f"no POL session from {client_ip}"
         return None, "no live POL session"
-    cands.sort()
+    # Signed in outranks unclaimed: a claim only tells live Viewers apart. With
+    # the claim first, a dead unclaimed session beat every live claimed one.
+    cands.sort(key=lambda c: (c[1], c[0]) + c[2:])
 
     # THE ADDRESS, WHEN IT ACTUALLY DISCRIMINATES, IS THE ANSWER.
     #
@@ -1607,9 +1632,74 @@ def should_swallow_charlist(ckey):
         return (time.time() - at) <= SWALLOW_TTL
 
 
+# ---------------------------------------------------------------------------
+# THE CLIENT BUILD, FOR THE MAP'S CONSOLE PROFILES.
+#
+# lsb-server's compat layer (PhoenixPS2 9eaad45) picks a console's translation
+# profile from `accounts_sessions.client_version`, because a PS2 sends Ver 0 in
+# its 0x00A. Their lobby writes that column; LSB's own xi_connect does not, so
+# without this every PS2 falls back to the first PS2 profile (the 2010 client).
+# The build is in the client's 0x26 at 0x74 ("20160203_0"; LSB itself reads
+# only the first six characters), and the session row exists by the 0x0B
+# handoff, which is when it is written.
+# ---------------------------------------------------------------------------
+#: client address -> the full version string from its last 0x26
+_client_build = {}
+_client_build_lock = threading.Lock()
+
+
+def note_client_build(pkt, ckey):
+    """Remember the version string a client's 0x26 reports, per address."""
+    if not ckey or len(pkt) < 0x74 + 16:
+        return
+    raw = bytes(pkt[0x74:0x74 + 16]).split(b"\0")[0]
+    try:
+        build = raw.decode("ascii")
+    except UnicodeDecodeError:
+        return
+    if build and build.isprintable():
+        with _client_build_lock:
+            _client_build[str(ckey).rsplit(":", 1)[0]] = build
+
+
+def store_client_build(charid, ckey, label):
+    """Write the client's build into its accounts_sessions row (background)."""
+    if not ckey:
+        return
+    with _client_build_lock:
+        build = _client_build.get(str(ckey).rsplit(":", 1)[0])
+    if not build:
+        return
+
+    def run():
+        try:
+            import pymysql
+            conn = pymysql.connect(host=LSB_DB_HOST, port=LSB_DB_PORT,
+                                   user=LSB_DB_USER, password=LSB_DB_PASS,
+                                   database=LSB_DB_NAME, autocommit=True,
+                                   connect_timeout=5)
+            try:
+                with conn.cursor() as cur:
+                    n = cur.execute("UPDATE accounts_sessions SET client_version = %s "
+                                    "WHERE charid = %s", (build, charid))
+            finally:
+                conn.close()
+            log(label, f"  0x0B handoff: charid {charid} client_version = {build} "
+                       f"({n} session row{'' if n == 1 else 's'})")
+        except Exception as exc:
+            # An LSB image without migration 067 has no such column, and nothing
+            # there reads it either, so this is only worth a line in the log.
+            log(label, f"  0x0B handoff: could not store client_version for "
+                       f"charid {charid}: {exc!r}")
+
+    threading.Thread(target=run, daemon=True).start()
+
+
 def rewrite_c2s(pkt, label, member_id=None, ckey=None, ambiguous=False):
     """Client -> LSB: turn a POL Content ID back into the LSB charid."""
     cmd = pkt[8]
+    if cmd == 0x26:
+        note_client_build(pkt, ckey)
     if cmd in C2S_CREATE and ambiguous:
         # BLOCK THE CREATE, allow everything else. A select is protected by POL's
         # own character-table check (a mismatch surfaces as POL-0001 rather than
@@ -1701,6 +1791,19 @@ def rewrite_s2c(pkt, label, member_id=None, ckey=None):
             log(label, f"  0x23 world list: world id is 0x{seen:02X} "
                        f"(was using 0x{_world_id:02X})")
             _world_id = seen
+        global _world_name
+        _world_name = bytes(pkt[WORLD_LIST_FIRST_NO + 4:WORLD_LIST_FIRST_NO + 20]
+                            ).split(b"\0")[0].decode("latin1").strip() or _world_name
+        remote = FED.usable() if FED is not None and FED.allows(member_id) else []
+        if remote:
+            count = struct.unpack_from("<I", pkt, HDR_LEN)[0]
+            out = bytearray(out[:WORLD_LIST_FIRST_NO + count * ffxi_federation.WORLD_REC_LEN])
+            out += ffxi_federation.world_list_entries(remote)
+            struct.pack_into("<I", out, 0, len(out))
+            struct.pack_into("<I", out, HDR_LEN, count + len(remote))
+            changed = True
+            log(label, "  0x23 world list: + " + ", ".join(
+                f"0x{w.no:02X} {w.name!r}" for w in remote) + " (federation)")
     if cmd == 0x20 and len(pkt) >= CHR_LIST_OFF:
         count = struct.unpack_from("<I", pkt, HDR_LEN)[0]
         slots = range(min(count, (len(pkt) - CHR_LIST_OFF) // CHR_REC_LEN))
@@ -1708,7 +1811,15 @@ def rewrite_s2c(pkt, label, member_id=None, ckey=None):
         for i in slots:
             off = CHR_LIST_OFF + i * CHR_REC_LEN
             charid = struct.unpack_from("<I", pkt, off)[0]
-            if not charid:
+            name = bytes(pkt[off + 12:off + 28]).split(b"\0")[0].decode("latin1")
+            # A blank name is an empty slot even when ffxi_id is not 0. LSB keeps
+            # the char list it built at login and, on a delete, only blanks the
+            # NAME of the deleted record (`deleteCharFromCharInfo`), so every list
+            # until the next login still carries the deleted charid. Pairing that
+            # record put the deleted character back on the member's only Content
+            # ID, the recreate was refused it, and the new character drew -0001
+            # (prod 2026-10-01, charids 9 -> 36 -> 38).
+            if not charid or not name.strip():
                 empty.append((i, off))
                 continue
             with _idmap_lock:
@@ -1718,7 +1829,6 @@ def rewrite_s2c(pkt, label, member_id=None, ckey=None):
                 prefer = (_pending_create.pop(ckey, None)
                           if ckey and str(charid) not in _idmap else None)
             cid = content_id_for(charid, prefer=prefer, member_id=member_id)
-            name = bytes(pkt[off + 12:off + 28]).split(b"\0")[0].decode("latin1")
             note_char_name(charid, name)
             if WORLD_ID_FIX and struct.unpack_from("<H", pkt, off + CHR_REC_WORLDID)[0] != _world_id:
                 struct.pack_into("<H", out, off + CHR_REC_WORLDID, _world_id)
@@ -1736,38 +1846,65 @@ def rewrite_s2c(pkt, label, member_id=None, ckey=None):
             # was told. The zone is reassembled from its two halves -- see
             # CHR_REC_ZONE_HI, which is the difference between "Al Zahbi" and a
             # zone 256 rows down the enum.
-            note_char_fields(charid, {
-                "world": bytes(out[off + CHR_REC_WORLDNAME:
-                                   off + CHR_REC_WORLDNAME + 16]
-                               ).split(b"\0")[0].decode("latin1").strip(),
-                "nation": out[off + CHR_REC_NATION],
-                "zone": out[off + CHR_REC_ZONE]
-                        | ((out[off + CHR_REC_ZONE_HI] & 1) << 8),
-                "job": out[off + CHR_REC_JOB],
-                "joblevel": out[off + CHR_REC_JOBLEVEL],
-                "race": struct.unpack_from("<H", out, off + CHR_REC_RACE)[0],
-            })
+            #
+            # Race 0 means LSB never filled the tail: the record it caches for a
+            # character created in this login session carries the name and ids
+            # only (`createCharacter`), so every field reads 0. Recording that
+            # would overwrite the real profile with zeros until the next login.
+            if struct.unpack_from("<H", out, off + CHR_REC_RACE)[0] != 0:
+                note_char_fields(charid, {
+                    "world": bytes(out[off + CHR_REC_WORLDNAME:
+                                       off + CHR_REC_WORLDNAME + 16]
+                                   ).split(b"\0")[0].decode("latin1").strip(),
+                    "nation": out[off + CHR_REC_NATION],
+                    "zone": out[off + CHR_REC_ZONE]
+                            | ((out[off + CHR_REC_ZONE_HI] & 1) << 8),
+                    "job": out[off + CHR_REC_JOB],
+                    "joblevel": out[off + CHR_REC_JOBLEVEL],
+                    "race": struct.unpack_from("<H", out, off + CHR_REC_RACE)[0],
+                })
             if cid is None:
                 continue
             struct.pack_into("<I", out, off, cid)
             changed = True
             log(label, f"  0x20 slot {i}: {name!r} charid {charid} -> ffxi_id {cid}")
+        if FED is not None and FED.allows(member_id) and empty:
+            empty, placed = place_remote_chars(out, empty, member_id, label)
+            changed = changed or placed
         # An EMPTY slot is where the client creates, and in retail it carries the
         # unused Content ID that the new character will be registered against --
         # LSB has none to put there and sends 0. Handing the client a real free
         # Content ID is what lets it name one on the create request, which is the
-        # pairing `rewrite_c2s` then records. Slots past our entitlement keep the
-        # 0 LSB sent, which reads as "not available".
+        # pairing `rewrite_c2s` then records.
         with _idmap_lock:
             taken = set(_idmap.values())
-        free = [c for c in pol_content_ids(member_id) if c not in taken]
+        pool = pol_content_ids(member_id)
+        free = [c for c in pool if c not in taken]
         for (i, off), cid in zip(empty, free):
             struct.pack_into("<I", out, off, cid)
             changed = True
             log(label, f"  0x20 slot {i}: EMPTY -> free Content ID {cid}")
-        if len(empty) > len(free):
-            log(label, f"  0x20: {len(empty) - len(free)} empty slot(s) left at ffxi_id 0 "
-                       f"-- POL issues {len(pol_content_ids(member_id))} FFXI Content ID(s), "
+        # Slots past our entitlement are DROPPED from the list. Left at ffxi_id 0
+        # they still read as "Create" to the client, which creates there, names
+        # a Content ID that is already spent, and the character can never load
+        # (-0001; prod 2026-10-01, charid 35 on a one-id account). LSB pads the
+        # list to `accounts.content_ids`, and LSB makes every account with the
+        # schema default of 16, so this is the usual case, not an edge. The
+        # list's LENGTH is what the client reads as its slot count. An empty
+        # pool is a failed read as often as a real one, so it drops nothing.
+        dead = empty[len(free):] if pool else []
+        if dead:
+            gone = {i for i, _ in dead}
+            keep = [i for i in slots if i not in gone]
+            recs = b"".join(bytes(out[CHR_LIST_OFF + i * CHR_REC_LEN:
+                                      CHR_LIST_OFF + (i + 1) * CHR_REC_LEN])
+                            for i in keep)
+            out = bytearray(out[:CHR_LIST_OFF]) + recs
+            struct.pack_into("<I", out, 0, len(out))
+            struct.pack_into("<I", out, HDR_LEN, len(keep))
+            changed = True
+            log(label, f"  0x20: {len(dead)} empty slot(s) dropped, no Content ID behind them "
+                       f"-- POL issues {len(pool)} FFXI Content ID(s), "
                        f"{len(taken)} already spent")
     elif cmd == 0x0B and len(pkt) >= HDR_LEN + 8 + 16:
         # The handoff names the character that is entering the world, so it is
@@ -1775,6 +1912,7 @@ def rewrite_s2c(pkt, label, member_id=None, ckey=None):
         charid = struct.unpack_from("<I", pkt, HDR_LEN)[0]
         note_char_name(charid, bytes(pkt[HDR_LEN + 8:HDR_LEN + 24])
                        .split(b"\0")[0].decode("latin1"))
+        store_client_build(charid, ckey, label)
         if WORLD_ID_FIX and len(pkt) >= NEXT_LOGIN_SERVER_ID + 4:
             was = struct.unpack_from("<I", pkt, NEXT_LOGIN_SERVER_ID)[0]
             if was != _world_id:
@@ -1805,6 +1943,145 @@ def rewrite_s2c(pkt, label, member_id=None, ckey=None):
     if not changed:
         return pkt
     return resign(bytes(out))
+
+
+def remote_world_field(world_no, charid):
+    """The 1:3 world field for a remote character: its charid split the way the 0x20 record
+    carries it, under the remote world's number."""
+    return pack_world_field(charid & 0xFFFF, world_no, (charid >> 16) & 0xFF)
+
+
+def place_remote_chars(out, empty, member_id, label):
+    """Put the member's characters on remote worlds into empty slots of a 0x20 (in place).
+
+    Each is paired with one of the member's Content IDs under its remote key, exactly like a
+    local character, so POL's 1:3 table lists it and the client's select-time lookup finds it
+    (POL-0001 otherwise). A character with no Content ID left for it is not shown: it could
+    not be played. Returns (the slots still empty, whether anything was placed)."""
+    placed = False
+    for world in FED.usable():
+        for char in FED.characters(member_id, world):
+            if not empty:
+                log(label, f"  0x20: no empty slot left for {char.get('name')!r} on {world.name!r}")
+                return empty, placed
+            charid = int(char["id"])
+            key = ffxi_federation.remote_key(world.no, charid)
+            cid = content_id_for(key, member_id=member_id)
+            if cid is None:
+                log(label, f"  0x20: {char.get('name')!r} on {world.name!r} has no Content ID "
+                           f"free (POL_FFXI_CHARACTER_SLOTS); not listed")
+                continue
+            i, off = empty.pop(0)
+            out[off:off + ffxi_federation.REC_LEN] = ffxi_federation.char_record(world, char, cid)
+            note_char_name(key, char.get("name") or "")
+            note_world_field(key, remote_world_field(world.no, charid))
+            job = char.get("job") or {}
+            note_char_fields(key, {"world": world.name, "nation": char.get("nation"),
+                                   "zone": char.get("zone"), "job": job.get("main"),
+                                   "joblevel": job.get("main_level"), "race": char.get("race")})
+            placed = True
+            log(label, f"  0x20 slot {i}: {char.get('name')!r} on {world.name!r} "
+                       f"(remote charid {charid}) -> ffxi_id {cid}")
+    return empty, placed
+
+
+#: connection key -> (world no, character name, Content ID) chosen on a 0x22 name check for a
+#: REMOTE world, waiting for the 0x21 that commits it. The 0x21 does not name the world.
+_fed_create = {}
+
+
+def fed_c2s(pkt, label, member_id=None, ckey=None, ambiguous=False):
+    """Answer a client request that belongs to a REMOTE world, instead of relaying it.
+
+    Returns None for everything that is ours (it goes to LSB as before), else
+    (replies to the client, whether to close the connection after them)."""
+    cmd = pkt[8]
+    F = ffxi_federation
+    if not FED.allows(member_id):
+        return None             # not shown any remote world: everything is ours
+    if cmd == 0x22:
+        name, world_name = F.name_check_fields(pkt)
+        if _world_name and world_name.lower() == _world_name.lower():
+            world = None        # our own world's name is always ours (the tool refuses it too)
+        else:
+            world = next((w for w in FED.usable() if w.name.lower() == world_name.lower()), None)
+        if world is None:
+            _fed_create.pop(ckey, None)
+            return None
+        if ambiguous:
+            log(label, f"  0x22: create on {world.name!r} REFUSED -- no single POL member "
+                       f"for this launch")
+            return [F.error_packet(F.ERR_LOBBY)], False
+        named = struct.unpack_from("<I", pkt, HDR_LEN)[0]
+        _fed_create[ckey] = (world.no, name, named)
+        log(label, f"  0x22: {name!r} on remote world {world.name!r} (Content ID {named}); "
+                   f"the name is checked when the create commits")
+        return [F.ok_packet()], False
+    if cmd == 0x21:
+        choice = _fed_create.pop(ckey, None)
+        if choice is None:
+            return None
+        world, name, named = FED.world(choice[0]), choice[1], choice[2]
+        fields = F.create_fields(pkt)
+        try:
+            charid = world.gateway.create_character(
+                FED.issuer.account(world.server_id, str(member_id)), name, fields["race"],
+                fields["face"], fields["size"], fields["job"], fields["nation"])
+        except (OSError, ffxi_federation.X.GatewayError) as exc:
+            code = F.ERR_NAME_UNAVAILABLE if getattr(exc, "error", "").startswith("name_") else F.ERR_LOBBY
+            log(label, f"  0x21: create {name!r} on {world.name!r} FAILED ({exc}) -> error {code}")
+            return [F.error_packet(code)], False
+        key = F.remote_key(world.no, charid)
+        # Paired NOW, before the client's POL 1:3 refetch (the race request_charlist_refresh
+        # exists for on our own world: here the gateway already told us the charid).
+        content_id_for(key, prefer=named or None, member_id=member_id)
+        note_char_name(key, name)
+        note_world_field(key, remote_world_field(world.no, charid))
+        FED.forget(member_id, world)
+        log(label, f"  0x21: created {name!r} on {world.name!r} as remote charid {charid}")
+        return [F.ok_packet()], False
+    if cmd not in (0x07, 0x14, 0x28) or len(pkt) < HDR_LEN + 4:
+        return None
+    key = charid_for(struct.unpack_from("<I", pkt, HDR_LEN)[0])
+    remote = F.split_remote_key(key) if key is not None else None
+    if remote is None:
+        return None
+    world, charid = FED.world(remote[0]), remote[1]
+    name = _charnames.get(str(key), "")
+    if world is None or not world.refresh() or member_id is None:
+        log(label, f"  cmd 0x{cmd:02x}: remote world 0x{remote[0]:02X} unavailable")
+        return [F.error_packet(F.ERR_CANNOT_CONNECT_WORLD)], False
+    account = FED.issuer.account(world.server_id, str(member_id))
+    try:
+        if cmd == 0x14:
+            world.gateway.delete_character(account, charid)
+            release_charid(key, why=f"deleted on {world.name!r}")
+            FED.forget(member_id, world)
+            return [F.ok_packet()], False
+        if cmd == 0x28:
+            new = bytes(pkt[0x24:0x34]).split(b"\0")[0].decode("latin1").strip()
+            world.gateway.rename_character(account, charid, new)
+            note_char_name(key, new)
+            FED.forget(member_id, world)
+            return [F.ok_packet()], False
+        # 0x07: enter the remote world.
+        ip = str(ckey).rsplit(":", 1)[0] if ckey else ""
+        with _client_build_lock:
+            build = _client_build.get(ip, "")
+        entry = FED.issuer.world_entry(
+            world.server_id, str(member_id), charid, FED.client_ip(ip), build[:16],
+            int((world.keyset.world or {}).get("expansions") or 1), A2_SESSION_KEY, char_name=name or None)
+        map_ip, map_port = world.gateway.world_entry(entry)
+    except (OSError, ValueError, ffxi_federation.X.GatewayError) as exc:
+        err = getattr(exc, "error", "")
+        code = (201 if err == "already_logged_in" else F.ERR_NAME_UNAVAILABLE if err.startswith("name_")
+                else F.ERR_CANNOT_CONNECT_WORLD)
+        log(label, f"  cmd 0x{cmd:02x}: {name!r} on {world.name!r} FAILED ({exc}) -> error {code}")
+        return [F.error_packet(code)], False
+    log(label, f"  0x07: {name!r} enters {world.name!r} (remote charid {charid}) -> map "
+               f"{map_ip}:{map_port}, client as {FED.client_ip(ip)} build {build or '?'}")
+    # LSB closes the view socket after its 0x0B and the client waits for that close.
+    return [F.next_login_packet(charid, name, world.no, map_ip, map_port, world.search)], True
 
 
 #: connection key -> the Content ID the client named on its create request,
@@ -1844,6 +2121,20 @@ def pump(src, dst, rewrite, session_hash, label, member_id=None, ckey=None,
                 # translation rather than silently the pre-rewrite bytes.
                 dump_packet(label, pkt)
                 cmd, orig = pkt[8], pkt
+                fed = (fed_c2s(pkt, label, member_id, ckey, ambiguous)
+                       if rewrite and FED is not None else None)
+                if fed is not None:
+                    # A REMOTE world's request: answered here, never sent to LSB.
+                    replies, close = fed
+                    if out:
+                        dst.sendall(bytes(out))
+                        out = bytearray()
+                    for r in replies:
+                        dump_packet(label + "-federation", r)
+                        src.sendall(r)
+                    if close:
+                        return
+                    continue
                 if rewrite:
                     if FFXI_ID_MAP:
                         pkt = rewrite_c2s(pkt, label, member_id, ckey, ambiguous)
@@ -2135,6 +2426,7 @@ def handle_client(client, addr, lsb_port, chan):
         _create_pending.pop(ckey, None)
     with _idmap_lock:
         _pending_create.pop(ckey, None)
+    _fed_create.pop(ckey, None)
     log(chan, f"client {addr} session closed")
 
 
@@ -2830,6 +3122,41 @@ def tombstone_loop():
 INGAME_KEY = "ffxi:ingame"
 INGAME_PERIOD = float(os.environ.get("FFXI_INGAME_PERIOD") or 5)
 
+#: In-game GM calls (the Help Desk, packet 0x0D3) land in LSB's `help_desk`
+#: table and nowhere else. ffxi_gmcalls.py files each one as a ticket on the
+#: core's GM desk and writes the desk's answer back for the game to show.
+#: Seconds between polls; 0 turns it off.
+GMCALL_PERIOD = float(os.environ.get("FFXI_GMCALL_PERIOD") or 10)
+#: Where gmd files tickets (the core's POL_GMD_TICKET_DIR), mounted read-write.
+GMCALL_DIR = (os.environ.get("FFXI_GMCALL_DIR")
+              or os.environ.get("POL_GMD_TICKET_DIR") or "/data/gm-calls")
+#: First run only: file calls after this help_desk row ("0" = every call ever
+#: made). Unset = start at the newest row, so old calls are not re-raised.
+GMCALL_SINCE_ID = os.environ.get("FFXI_GMCALL_SINCE_ID")
+
+
+def gmcall_content_id(charid):
+    with _idmap_lock:
+        return _idmap.get(str(charid))
+
+
+def gmcall_handle(content_id):
+    A = ffxidb.accounts()
+    conn = A.connect()
+    try:
+        return A.handle_by_content_id(conn, content_id)
+    finally:
+        conn.close()
+
+
+def gmcall_loop():
+    relay = ffxi_gmcalls.Relay(
+        GMCALL_DIR, gmcall_content_id, gmcall_handle,
+        log=lambda m: log("gmcall", m),
+        since_id=int(GMCALL_SINCE_ID) if (GMCALL_SINCE_ID or "").strip().isdigit() else None)
+    ffxi_gmcalls.run(relay, session_key_connect, GMCALL_PERIOD,
+                     log=lambda m: log("gmcall", m))
+
 
 def ingame_snapshot(rows, acctmap, idmap, charnames, worldfields):
     """`{str(member): {...}}` from `(login, charid)` rows. Pure, for the test.
@@ -3151,6 +3478,11 @@ def main():
                     f"0x0B world handoff {'REWRITTEN' if MAP_HANDOFF else 'left alone'}")
     else:
         log("boot", "Content-ID translation OFF (FFXI_ID_MAP=0)")
+    if reload_federation() is None:
+        log("boot", "federation OFF (no remote world in FFXI_FED_WORLDS): our own world only")
+    import ffxi_fedtool
+    if ffxi_fedtool.start(sys.modules[__name__]) is None:
+        log("boot", "federation admin tool OFF (FFXI_FEDTOOL_PORT unset)")
     # Smoke-test auth once at startup so misconfig is obvious immediately. On a
     # fresh LSB the shared account does not exist yet, so a refused login is
     # followed by one LOGIN_CREATE and a retry; anything else is a real warning.
@@ -3178,6 +3510,12 @@ def main():
         log("boot", f"in-world feed -> kv {INGAME_KEY} every {INGAME_PERIOD:g}s")
     else:
         log("boot", "in-world feed OFF (FFXI_INGAME_PERIOD=0)")
+    if GMCALL_PERIOD > 0:
+        threading.Thread(target=gmcall_loop, daemon=True).start()
+        log("boot", f"in-game GM calls -> {GMCALL_DIR} every {GMCALL_PERIOD:g}s, "
+                    f"desk answers -> help_desk.response")
+    else:
+        log("boot", "in-game GM call relay OFF (FFXI_GMCALL_PERIOD=0)")
     threading.Thread(target=listener, args=(BRIDGE_VIEW, LSB_VIEW_PORT, "VIEW"), daemon=True).start()
     threading.Thread(target=listener, args=(BRIDGE_DATA, LSB_DATA_PORT, "DATA"), daemon=True).start()
     if BRIDGE_MAP:

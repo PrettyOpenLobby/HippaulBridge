@@ -18,6 +18,11 @@ RUN pip install --no-cache-dir pymysql
 WORKDIR /app
 COPY ffxi_bridge.py /app/ffxi_bridge.py
 COPY ffxi_import_core.py /app/ffxi_import_core.py
+COPY ffxi_gmcalls.py /app/ffxi_gmcalls.py
+# FFXI federation (provider side): the lobby's remote worlds and the tokens.
+COPY ffxi_federation.py /app/ffxi_federation.py
+COPY xitoken.py /app/xitoken.py
+COPY ffxi_fedtool.py /app/ffxi_fedtool.py
 # The bridge's tables: the database plumbing and HippaulBridge's migrations
 # (6001-6999), applied by the bridge when it starts.
 COPY ffxidb.py /app/ffxidb.py

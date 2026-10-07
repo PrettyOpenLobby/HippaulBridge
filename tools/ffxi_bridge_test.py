@@ -427,6 +427,47 @@ else:
     check(False, "bridge has no release_parked")
 
 # ---------------------------------------------------------------------------
+# LSB caches the login's char list: a delete blanks only the NAME, a create
+# adds a record with no profile tail, and the list is padded to content_ids.
+print("\n[cached list] a create in the same login after a delete, and slots no id backs")
+reset([30000221])
+K = "192.0.2.9:50009"
+B._idmap["9"] = 30000221
+B.rewrite_c2s(c2s(0x14, 30000221), "c->s", 10, K)
+# LSB's next list: charid 9 still there, its name blanked to " ".
+out = s2c(s2c_20([(9, b" ")]), 10, K)
+check("9" not in B._idmap, f"the blanked record does not re-pair charid 9 ({B._idmap})")
+check(served(out) == [30000221], f"...and its slot is offered the freed id ({served(out)})")
+create(K, 30000221, b"Weasel", 10)
+out = s2c(s2c_20([(38, b"Weasel")]), 10, K)
+check(B._idmap.get("38") == 30000221,
+      f"the recreated charid 38 gets the member's Content ID ({B._idmap})")
+check(served(out) == [30000221], f"...and is served on it ({served(out)})")
+
+print("   ...and slots past the member's Content IDs are not offered at all")
+reset([30000312])
+B._idmap["16"] = 30000312
+out = s2c(s2c_20([(16, b"Koshin")] + [(0, b" ")] * 15), 26, K)
+check(served(out) == [30000312], f"a one-id member is shown one slot, not sixteen ({served(out)})")
+check(struct.unpack_from("<I", out, 0)[0] == len(out) == 28 + 4 + 140,
+      f"packet_size matches the shortened list ({len(out)})")
+reset([30000312, 30000313])
+B._idmap["16"] = 30000312
+out = s2c(s2c_20([(16, b"Koshin")] + [(0, b" ")] * 15), 26, K)
+check(served(out) == [30000312, 30000313], f"a two-id member keeps one Create slot ({served(out)})")
+reset([])
+out = s2c(s2c_20([(16, b"Koshin")] + [(0, b" ")] * 3), 26, K)
+check(len(served(out)) == 4, "an empty pool (a failed account read) drops nothing")
+
+print("   ...and a just-created record with no profile tail does not zero the profile")
+reset([30000415])
+B._idmap["37"] = 30000415
+B._charfields["37"] = {"race": 7, "job": 6, "zone": 230}
+s2c(s2c_20([(37, b"Artemis")]), 23, K)
+check(B._charfields.get("37", {}).get("race") == 7,
+      f"race 0 in LSB's cached record is not recorded ({B._charfields.get('37')})")
+
+# ---------------------------------------------------------------------------
 shutil.rmtree(TMP, ignore_errors=True)
 if FAILS:
     print(f"\nFAIL: {len(FAILS)} check(s):")

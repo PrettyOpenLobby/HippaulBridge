@@ -220,6 +220,38 @@ the record's 0x08 field filled with the character's world field and Content
 ID, laid out as LandSandBoat's xi_profile names it. It is off by default
 because no Viewer has been seen to draw it yet.
 
+## GM calls from the game
+
+A GM call sent from the game's Help Desk never touches the PlayOnline Viewer:
+the client sends it to the map server (packet 0x0D3), and LandSandBoat stores
+it in its `help_desk` table and logs it on xi_world, where routing it anywhere
+else is still a TODO upstream. On its own, nobody at the GM desk would see it.
+
+The bridge closes that gap. Every `FFXI_GMCALL_PERIOD` seconds (default 10;
+0 turns it off) it reads new `help_desk` rows and files each one as a ticket
+in the directory OpenLobby's `gmd` writes and the admin panel's GM desk reads
+(`FFXI_GMCALL_DIR`, the core's `/data/gm-calls`), in the same form gmd files a
+Viewer call. The desk then treats it like any other request: the Discord and
+Web Push alert, the reply mailed when no GM is on duty, knock, invite, close
+and the transcript mail all work unchanged. The caller is the handle the
+character's Content ID is linked to, and the ticket carries that handle's
+client id, so it is the player's own if they open the Viewer's GM Call screen
+later and nobody else's. The ticket's `ffxi` block names the character, zone
+and `help_desk` row.
+
+The other way round, the bridge writes what the desk did back into
+`help_desk.response`, which the game shows the character as a GM message on
+their next zone or login: that no GM was on duty, that a GM is ready in the
+Viewer's GM chat (a knock), and the close, with the GM's resolution note when
+one was written. Each event is delivered once; the ticket records it.
+
+This needs the gm-calls directory mounted read-write in the bridge container
+(the compose file does this with a volume subpath, which needs Docker 25 and
+Compose 2.26 or newer). Without it the bridge log says so every poll and the
+calls wait in `help_desk`. On the first start the bridge begins at the newest
+`help_desk` row; `FFXI_GMCALL_SINCE_ID=0` files every call already there
+instead. The bridge's own watermark is `ffxi-helpdesk.json` in that directory.
+
 Attribution needs a signed-in Viewer session. The FFXI lobby stream carries no
 PlayOnline identity, so the bridge reads OpenLobby's session table: one
 signed-in session at the client's address is the answer; two behind one NAT

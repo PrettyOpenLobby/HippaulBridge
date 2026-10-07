@@ -240,6 +240,15 @@ services:
       # Seconds between polls of LSB's accounts_sessions for the in-world
       # feed (which character each member is playing); 0 turns it off.
       FFXI_INGAME_PERIOD: "${FFXI_INGAME_PERIOD:-}"
+      # In-game GM calls (the Help Desk) only reach LSB's help_desk table.
+      # The bridge files each one on the core's GM desk (the gm-calls
+      # directory gmd and the admin panel share, mounted read-write below)
+      # and writes the desk's answer back for the game to show. Seconds
+      # between polls; 0 turns it off. FFXI_GMCALL_SINCE_ID=0 on first start
+      # files every call already in help_desk instead of only new ones.
+      FFXI_GMCALL_PERIOD: "${FFXI_GMCALL_PERIOD:-10}"
+      FFXI_GMCALL_DIR: /data/gm-calls
+      FFXI_GMCALL_SINCE_ID: "${FFXI_GMCALL_SINCE_ID:-}"
       # The bridge does not open while ffxi_idmap is empty and the id map an
       # earlier release kept (ffxi_idmap.json on the core's data volume,
       # mounted read-only below) still holds pairings: it waits for
@@ -290,8 +299,15 @@ services:
       - "54004:54004"          # character-import endpoint (BRIDGE_IMPORT_PORT)
     volumes:
       - bridge-logs:/logs
-      # read-only, for the old ffxi_idmap.json only (see FFXI_IDMAP_START_EMPTY)
+      # The core's data volume: ffxi_idmap.json from an earlier release (see
+      # FFXI_IDMAP_START_EMPTY), read only, and the GM desk's gm-calls
+      # directory, which the in-game GM call relay writes tickets into.
       - pol-data:/data:ro
+      - type: volume
+        source: pol-data
+        target: /data/gm-calls
+        volume:
+          subpath: gm-calls
     healthcheck:
       test: ["CMD", "python", "-c",
              "import socket;socket.create_connection(('127.0.0.1',54001),2).close()"]
