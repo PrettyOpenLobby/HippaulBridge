@@ -72,6 +72,16 @@ WORLD_ID = int(os.environ.get("POL_FFXI_WORLD_ID", "0x20"), 0)
 #: explanation. `trim-slots` cleans that up.
 CHARACTER_SLOTS = max(1, int(os.environ.get("POL_FFXI_CHARACTER_SLOTS") or 1))
 
+#: How many FFXI characters one MEMBER can have in all, retail's sixteen (and
+#: the `accounts.content_ids` LSB gives every account). CHARACTER_SLOTS stays on
+#: the primary handle; the rest go on handles holding only FFXI, which the core
+#: creates once the member has used every slot they have
+#: (accounts.ensure_overflow_slots), so the primary handle and every other
+#: title on it are untouched. Capped by the client's four handles: 1 + 8 + 8 +
+#: 8 is the most it can ever reach. 0 or anything at or below CHARACTER_SLOTS
+#: turns it off.
+MEMBER_SLOTS = int(os.environ.get("POL_FFXI_MEMBER_SLOTS") or 16)
+
 #: WHICH CHARACTER A FRIEND IS PLAYING. The bridge polls LSB's
 #: `accounts_sessions` and publishes `{member: {content_id, world_field, ...}}`
 #: under this live-state key (ffxi_bridge.ingame_loop, INGAME_KEY there). The
@@ -213,15 +223,46 @@ class FinalFantasyXI(titles.Title):
     tag = b"XI0"
     content_code = CONTENT_CODE
     content_slots = CHARACTER_SLOTS
+    member_slots = MEMBER_SLOTS
+    #: the console clients' "save macros to the server": `U/g/0001_00.bak`, a
+    #: 292-byte header then a ZIP of the mcr*.dat books, written and read back
+    #: in windows (as the Xbox 360 client does it)
+    resource_windowed = ("U/g/0001_",)
 
     def describe(self):
         return f"FFXI id map (table {IDMAP})"
+
+    def spent_content_ids(self, conn=None):
+        # Straight off the id map, not world_fields(): that one answers {} for a
+        # map it could not read, and {} here would read as "every slot free".
+        try:
+            return {int(cid) for cid in ids_in_use(conn)}
+        except Exception as exc:
+            _log(f"FFXI id map (table {IDMAP}) unreadable ({exc!r}); "
+                 f"no character slots added this time")
+            return None
 
     def character_world(self, cid):
         try:
             return world_fields().get(int(cid))
         except (TypeError, ValueError):
             return None
+
+    def character_by_world(self, world):
+        # The same map, read the other way: the 1:11 bind query carries the
+        # world dword of a character the asker is LOOKING AT in the game
+        # (0x00200056 for charid 86, say), which is some other member's
+        # character far more often than the asker's own.
+        try:
+            want = int(world) & 0xFFFFFFFF
+        except (TypeError, ValueError):
+            return None
+        if not want:
+            return None
+        for cid, field in world_fields().items():
+            if field == want:
+                return cid
+        return None
 
     def presence_character(self, member_id):
         # Only asked while the member's own 4:5 says FFXI, so the character
@@ -301,9 +342,14 @@ def trim_slots(conn, accounts, apply=False, handle=None,
         print("  so this cannot tell which ids have a character on them.")
 
     ceiling = accounts.CONTENT_IDS_PER_HANDLE
+    # Handles holding nothing but FFXI are left out: no other title can ever
+    # push them past the ceiling, and they are where a member's extra
+    # characters live (accounts.ensure_overflow_slots).
     q = ("SELECT h.id AS hid, h.handle_name, c.slot, c.content_id, c.status"
          "  FROM handle_content c JOIN handle h ON h.id = c.handle_id"
-         " WHERE c.content_code = %s AND c.slot <> 0")
+         " WHERE c.content_code = %s AND c.slot <> 0"
+         "   AND EXISTS (SELECT 1 FROM handle_content o WHERE o.handle_id = h.id"
+         "               AND o.content_code <> c.content_code)")
     params = [CONTENT_CODE]
     if handle:
         q += " AND h.handle_name = %s"

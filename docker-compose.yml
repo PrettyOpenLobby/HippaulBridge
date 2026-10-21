@@ -110,7 +110,7 @@ services:
         condition: service_completed_successfully
     environment:
       <<: *dbcreds
-      LSB_ADVERTISE_IP: "${LSB_ADVERTISE_IP:-127.0.0.1}"
+      LSB_ADVERTISE_IP: "${LSB_ADVERTISE_IP:-${POL_ADVERTISE:-127.0.0.1}}"
     entrypoint: ["sh", "-c"]
     command:
       - >
@@ -213,7 +213,7 @@ services:
       # The search/cache address handed to the client; the same LAN IP the
       # zones advertise, for the same reason (127.0.0.1 is wrong for any real
       # client).
-      SEARCH_IP: "${LSB_ADVERTISE_IP:-127.0.0.1}"
+      SEARCH_IP: "${LSB_ADVERTISE_IP:-${POL_ADVERTISE:-127.0.0.1}}"
       # The core's PostgreSQL and Valkey (OpenLobby's docs/database.md). The
       # accounts (which members hold which FFXI Content IDs) are read through
       # the core's accounts module; the bridge's own state, the Content ID map

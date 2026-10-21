@@ -319,6 +319,9 @@ FED = None
 #: Our own world's name, learned from LSB's 0x23. A remote world may never be shown under
 #: it: the client names the chosen world on a create by NAME (fed_c2s, 0x22).
 _world_name = ""
+#: In-game notices (ffxi_notices.py): the table writer, the calendar sync and, when off,
+#: why. Set in main(); the admin tool reads them.
+NOTICES = NOTICES_SYNC = NOTICES_OFF = None
 
 
 def reload_federation():
@@ -778,11 +781,15 @@ def resign(pkt):
 # the bridge authenticated to LSB as ONE shared account, so the character list
 # came back identical no matter who asked.
 #
-# **The FFXI lobby stream carries no POL identity.** `0x26` is version and
-# expansions, `0x1F` is a bare poke, and the first packet naming a Content ID is
-# `0x07` -- the character SELECT, which is far too late: LSB has already built
-# the list by then. So the identity cannot be read off the wire, and it has to
-# come from POL.
+# **The FFXI lobby stream names the POL login after all.** `0x26` carries, at
+# payload offset 24, the 52-byte credential blob polcore builds at launch; it
+# decodes to a hash the core files when it answers 4:5 (contentauth.py,
+# member_for_credential below). That is the first thing the connection handler
+# tries, and when it hits nothing below this line runs. What follows is the
+# fallback for a blob the core has no hash for: `0x1F` is a bare poke, and the
+# first packet naming a Content ID is `0x07` -- the character SELECT, which is
+# far too late: LSB has already built the list by then. So without the blob
+# the identity has to come from POL's session table.
 #
 # POL publishes it already: the core stack's auth service keeps a session
 # table mapping a session id to `{member_id, peer_ip, at, ...}`, in the core's
@@ -1341,20 +1348,73 @@ def peek_pol_session(client, timeout=3.0):
     A client with no shim (or an old one, or the PS2 Viewer) simply has no magic
     here, and the caller falls back to the address match and then the heuristics.
     """
-    old = client.gettimeout()
-    try:
-        client.settimeout(timeout)
-        data = client.recv(4096, socket.MSG_PEEK)
-    except Exception:
+    data = peek_first_packet(client, timeout)
+    if not data:
         return None
+    return read_poltoken(data)
+
+
+#: `0x26` is 152 bytes: the 28-byte header, 24 bytes, then the 52-byte
+#: credential blob polcore built at launch (contentauth.decode_blob).
+CREDENTIAL_OFF = HDR_LEN + 24
+CREDENTIAL_END = CREDENTIAL_OFF + 52
+
+
+def peek_first_packet(client, timeout=3.0, want=CREDENTIAL_END):
+    """The client's first packet, left in the kernel buffer (MSG_PEEK). Keeps
+    peeking until `want` bytes are there or the timeout passes, because the
+    first segment can stop short of the credential blob."""
+    old = client.gettimeout()
+    deadline = time.time() + timeout
+    data = b""
+    try:
+        while True:
+            left = deadline - time.time()
+            if left <= 0:
+                break
+            client.settimeout(min(left, 0.5))
+            try:
+                data = client.recv(4096, socket.MSG_PEEK)
+            except socket.timeout:
+                continue
+            except Exception:
+                break
+            if not data or len(data) >= want:
+                break
+            # A short peek returns at once with the same bytes; wait for more.
+            time.sleep(0.02)
     finally:
         try:
             client.settimeout(old)
         except Exception:
             pass
-    if not data:
-        return None
-    return read_poltoken(bytes(data))
+    return bytes(data) if data else None
+
+
+def member_for_credential(data, chan="VIEW"):
+    """(member_id, sid) from the credential blob in the client's `0x26`, or
+    (None, None) with the reason logged.
+
+    This is the identity SE's lobby used, and it needs nothing from the client
+    machine: polcore puts the same blob into every title's first packet, PS2
+    and PC alike, carrying a hash of this login's 4:5 reply, clock and key.
+    The core files that hash when it answers 4:5; a hit here is a fact, and
+    outranks the shim stamp and every ranking below it. (The high-entropy bytes
+    of `0x26` are easy to mistake for uninitialised client memory.)
+    """
+    if not data or len(data) < CREDENTIAL_END or data[4:8] != MAGIC or data[8] != 0x26:
+        return None, None
+    try:
+        contentauth = ffxidb._import_core("contentauth")
+    except Exception as exc:
+        log(chan, f"credential: contentauth unavailable ({exc!r}); falling back")
+        return None, None
+    mid, row, _how = contentauth.member_for_blob(
+        data[CREDENTIAL_OFF:CREDENTIAL_END], log=lambda m: log(chan, m),
+        tag="credential")
+    if mid is None:
+        return None, None
+    return mid, row.get("sid")
 
 
 _FIRSTBYTE_LOG = {}          # ip -> last time we logged a no-bytes drop
@@ -1410,7 +1470,7 @@ def wait_first_bytes(client, chan, addr, timeout=None):
     return False
 
 
-def get_session(client_ip, stamped_member=None, stamped_sid=None):
+def get_session(client_ip, stamped_member=None, stamped_sid=None, source="pol-shim"):
     """(account_id, session_hash, member_id) for a connecting FFXI client.
 
     Auth fresh per view connection. Caching risked handing back a hash whose LSB
@@ -1424,12 +1484,15 @@ def get_session(client_ip, stamped_member=None, stamped_sid=None):
     pre-2026-08-15 behaviour, and it is logged.
     """
     if stamped_member is not None:
-        # THE STAMPED PATH: no inference at all. pol-shim saw this launch's own
-        # `USER` token and the FFXI socket in one process, so it can state which
-        # POL session opened it rather than leaving us to rank candidates.
+        # THE STAMPED PATH: no inference at all. Either the credential blob in
+        # the client's own `0x26` named the login (SE's mechanism, every client
+        # including the PS2 - see member_for_credential), or pol-shim saw this
+        # launch's `USER` token and the FFXI socket in one process. Both state
+        # which POL session opened the connection rather than leaving us to
+        # rank candidates.
         acct_id, sh, login = lsb_member_session(stamped_member)
-        log("member", f"{client_ip} is POL member {stamped_member} -- STAMPED by "
-                      f"pol-shim ({stamped_sid}), no guessing -> LSB account "
+        log("member", f"{client_ip} is POL member {stamped_member} -- named by "
+                      f"the {source} ({stamped_sid}), no guessing -> LSB account "
                       f"{login!r} (id {acct_id})")
         return acct_id, sh, stamped_member, False
     member_id, how = resolve_pol_member(client_ip)
@@ -1635,7 +1698,7 @@ def should_swallow_charlist(ckey):
 # ---------------------------------------------------------------------------
 # THE CLIENT BUILD, FOR THE MAP'S CONSOLE PROFILES.
 #
-# lsb-server's compat layer (PhoenixPS2 9eaad45) picks a console's translation
+# PhoenixPS2's compat layer (9eaad45) picks a console's translation
 # profile from `accounts_sessions.client_version`, because a PS2 sends Ver 0 in
 # its 0x00A. Their lobby writes that column; LSB's own xi_connect does not, so
 # without this every PS2 falls back to the first PS2 profile (the 2010 client).
@@ -1818,7 +1881,7 @@ def rewrite_s2c(pkt, label, member_id=None, ckey=None):
             # until the next login still carries the deleted charid. Pairing that
             # record put the deleted character back on the member's only Content
             # ID, the recreate was refused it, and the new character drew -0001
-            # (prod 2026-10-01, charids 9 -> 36 -> 38).
+            # (charids 9 -> 36 -> 38 in one such case).
             if not charid or not name.strip():
                 empty.append((i, off))
                 continue
@@ -1887,7 +1950,7 @@ def rewrite_s2c(pkt, label, member_id=None, ckey=None):
         # Slots past our entitlement are DROPPED from the list. Left at ffxi_id 0
         # they still read as "Create" to the client, which creates there, names
         # a Content ID that is already spent, and the character can never load
-        # (-0001; prod 2026-10-01, charid 35 on a one-id account). LSB pads the
+        # (-0001; seen on a one-id account). LSB pads the
         # list to `accounts.content_ids`, and LSB makes every account with the
         # schema default of 16, so this is the usual case, not an edge. The
         # list's LENGTH is what the client reads as its slot count. An empty
@@ -2378,14 +2441,19 @@ def handle_client(client, addr, lsb_port, chan):
     try:
         # Look for pol-shim's stamp before choosing an LSB account. Costs one
         # MSG_PEEK and removes the guesswork entirely when it is present.
-        stamped_sid = peek_pol_session(client) if chan == "VIEW" else None
-        stamped_member = member_for_sid(stamped_sid) if stamped_sid else None
-        if stamped_sid and stamped_member is None:
-            log(chan, f"client stamped session {stamped_sid}, but POL has no such "
-                      f"session -- falling back. (A stale stamp means the Viewer "
-                      f"logged in before POL restarted.)")
+        first = peek_first_packet(client) if chan == "VIEW" else None
+        source = "credential blob"
+        stamped_member, stamped_sid = member_for_credential(first, chan)
+        if stamped_member is None:
+            source = "pol-shim"
+            stamped_sid = read_poltoken(first) if first else None
+            stamped_member = member_for_sid(stamped_sid) if stamped_sid else None
+            if stamped_sid and stamped_member is None:
+                log(chan, f"client stamped session {stamped_sid}, but POL has no such "
+                          f"session -- falling back. (A stale stamp means the Viewer "
+                          f"logged in before POL restarted.)")
         account_id, session_hash, member_id, ambiguous = get_session(
-            addr[0], stamped_member, stamped_sid)
+            addr[0], stamped_member, stamped_sid, source)
         log(chan, f"LSB session: account_id={account_id} "
                   f"hash={session_hash.hex()} (shared per client IP)")
     except Exception as e:
@@ -2719,6 +2787,64 @@ def session_key_row(conn, charid):
         return f"query failed: {exc}"
 
 
+# -- lost contact: a session the map timed out, recorded for the admin panel ----------------------
+#
+# A logout removes the accounts_sessions row within seconds of the client's last datagram. A client
+# that crashed, hung or lost its connection goes silent and the map times the session out about 60 s
+# later. The session-key watcher below already sees the row go; when the client had been silent for
+# LOST_CONTACT_SILENCE seconds by then, the session is written to openlobby_crash_log with where the
+# character was: chars.pos_zone/pos_prevzone, and the [Trail]* character variables a map-server
+# module sets on each console arrival: zone, previous zone, time, the arrival cutscene. Stock
+# LandSandBoat has no such module, and without one those fields stay empty. The admin panel's
+# Characters page lists the rows (ffxi_chars.py).
+LOST_CONTACT_SILENCE = float(os.environ.get("FFXI_LOST_CONTACT_SILENCE", "45"))
+CRASH_LOG_DDL = ("CREATE TABLE IF NOT EXISTS openlobby_crash_log (id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, "
+                 "at INT UNSIGNED NOT NULL, charid INT UNSIGNED NOT NULL, charname VARCHAR(32) NOT NULL DEFAULT '', "
+                 "console TINYINT UNSIGNED NOT NULL DEFAULT 0, zone SMALLINT UNSIGNED NOT NULL DEFAULT 0, "
+                 "prevzone SMALLINT UNSIGNED NOT NULL DEFAULT 0, trail_zone SMALLINT UNSIGNED NOT NULL DEFAULT 0, "
+                 "trail_prev SMALLINT UNSIGNED NOT NULL DEFAULT 0, trail_at INT UNSIGNED NOT NULL DEFAULT 0, "
+                 "trail_csid INT NOT NULL DEFAULT -1, silent_s SMALLINT UNSIGNED NOT NULL DEFAULT 0, "
+                 "c2s INT UNSIGNED NOT NULL DEFAULT 0, s2c INT UNSIGNED NOT NULL DEFAULT 0, KEY (at), KEY (charid)) "
+                 "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4")
+
+
+def lost_contact_silence(last, row, stats, now):
+    """Seconds the client had been silent when its session row went, if that was a lost contact; else None.
+
+    `last` is the watcher's previous reading (a key, or an error/"no row" string), `row` the current one,
+    `stats` the flow's _UDP_STATS entry ([c2s, c2s_bytes, s2c, s2c_bytes, last_c2s, last_s2c])."""
+    if row != "no accounts_sessions row" or last is None or last == row or str(last).startswith("query"):
+        return None
+    if not stats or not stats[4]:
+        return None
+    silent = now - stats[4]
+    return silent if silent >= LOST_CONTACT_SILENCE else None
+
+
+def record_lost_contact(conn, charid, silent, stats, now=None):
+    """Write one lost-contact row. Never raises: this is instrumentation and must not affect a flow."""
+    now = int(time.time() if now is None else now)
+    try:
+        conn.ping(reconnect=True)
+        with conn.cursor() as cur:
+            cur.execute(CRASH_LOG_DDL)
+            cur.execute("SELECT charname, pos_zone, pos_prevzone FROM chars WHERE charid = %s", (charid,))
+            ch = cur.fetchone() or ("", 0, 0)
+            cur.execute("SELECT varname, value FROM char_vars WHERE charid = %s AND varname LIKE %s",
+                        (charid, "[Trail]%"))
+            trail = {name[len("[Trail]"):]: value for name, value in cur.fetchall()}
+            cur.execute("INSERT INTO openlobby_crash_log (at, charid, charname, console, zone, prevzone, trail_zone, "
+                        "trail_prev, trail_at, trail_csid, silent_s, c2s, s2c) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                        (now, charid, (ch[0] or "")[:32], 1 if trail.get("Console") else 0, ch[1] or 0, ch[2] or 0,
+                         trail.get("Zone", 0), trail.get("Prev", 0), trail.get("At", 0), trail.get("Csid", -1),
+                         min(int(silent), 65535), stats[0] if stats else 0, stats[2] if stats else 0))
+        log("MAP", f"charid {charid}: LOST CONTACT -- client silent {silent:.0f}s before the map dropped the session; "
+                   f"zone {ch[1]}, arrival cutscene {trail.get('Csid', -1)} (openlobby_crash_log)")
+    except Exception as exc:
+        log("MAP", f"charid {charid}: lost-contact record failed: {exc!r}")
+
+
 #: charid last seen on a flow's opening 0x00A, and the flows already watched.
 #: Both keyed by client address so a reaped-and-rebuilt flow resumes rather
 #: than starting a second watcher against the same row.
@@ -2767,6 +2893,13 @@ def session_key_watcher(client, charid, peers):
                 break
             row = session_key_row(conn, charid)
             current = row if isinstance(row, str) else row["key"]
+            # The session just went? A logout goes within seconds of the last datagram; a long silence
+            # first is the map timing out a client that crashed, hung or lost its connection.
+            with _UDP_STATS_LOCK:
+                st = list(_UDP_STATS.get(client) or [])
+            silent = lost_contact_silence(last, current, st, time.time())
+            if silent is not None:
+                record_lost_contact(conn, charid, silent, st)
             if current != last:
                 if isinstance(row, str):
                     log("MAP", f"charid {charid}: session_key row -> {row}")
@@ -2818,6 +2951,11 @@ def udp_stats_reporter(period=15.0):
     while True:
         time.sleep(period)
         now = time.time()
+        try:
+            for client in udp_reap_idle(now):
+                last.pop(client, None)
+        except Exception as exc:
+            log("MAP", f"idle reap failed: {exc!r}")
         with _UDP_STATS_LOCK:
             snap = {c: list(v) for c, v in _UDP_STATS.items()}
         for client, st in snap.items():
@@ -2833,6 +2971,45 @@ def udp_stats_reporter(period=15.0):
 #: Per-client upstream sockets, `{client: connected-UDP-socket to the map}`.
 #: Module-global so `tools/ffxi_udp_relay_check.py` can pin the wedge below.
 _UDP_PEERS = {}
+
+#: A world client that stops sending (console off, link dropped) leaves its
+#: upstream socket, its `udp_back` thread blocked in recv() and its rows in
+#: the four per-client tables for the life of the process. Every such client
+#: is a thread and a socket, and a public server sees many. After this many
+#: seconds without a datagram either way the flow is torn down the same way
+#: the send-error path does it; the client's next datagram rebuilds it.
+UDP_IDLE = float(os.environ.get("FFXI_UDP_IDLE", "600"))
+
+
+def udp_reap_idle(now=None, idle=None):
+    """Tear down every flow idle past `idle` seconds. Returns the clients
+    reaped. Called from udp_stats_reporter's loop, so it runs every 15 s."""
+    now = time.time() if now is None else now
+    idle = UDP_IDLE if idle is None else idle
+    if idle <= 0:
+        return []
+    with _UDP_STATS_LOCK:
+        stale = [c for c, st in _UDP_STATS.items()
+                 if now - max(st[4], st[5]) > idle]
+    for client in stale:
+        up = _UDP_PEERS.pop(client, None)
+        with _UDP_STATS_LOCK:
+            _UDP_STATS.pop(client, None)
+        _UDP_SEEN.pop(client, None)
+        _WORLD_CHARID.pop(client, None)
+        if up is not None:
+            # shutdown() wakes the udp_back thread blocked in recv(); close()
+            # then makes its next recv() raise, which ends it. Popped from
+            # _UDP_PEERS first, so its identity-checked teardown is a no-op.
+            for step in (lambda: up.shutdown(socket.SHUT_RDWR), up.close):
+                try:
+                    step()
+                except OSError:
+                    pass
+        log("MAP", f"world client {client[0]}:{client[1]} idle for more than "
+                   f"{idle:g}s -- flow reaped" + ("" if up is not None else
+                                                 " (stats only; no socket)"))
+    return stale
 
 
 def udp_back(up, srv, client, peers, cap=None):
@@ -2972,7 +3149,7 @@ LSB_DB_PASS  = os.environ.get("LSB_DB_PASSWORD", "")
 # ---------------------------------------------------------------------------
 # A DELETED CHARACTER KEEPS ITS NAME -- LSB's delete is a SOFT delete.
 #
-# The lobby's 0x14 handler (lsb-server src/login/view_session.cpp) does NOT drop
+# The lobby's 0x14 handler (LSB's src/login/view_session.cpp) does NOT drop
 # the row: it runs `UPDATE chars SET accid = 0, original_accid = <acct>` so the
 # character can be recovered by hand. The create check
 # (login_helpers.cpp::characterCreationError) then asks
@@ -3480,6 +3657,19 @@ def main():
         log("boot", "Content-ID translation OFF (FFXI_ID_MAP=0)")
     if reload_federation() is None:
         log("boot", "federation OFF (no remote world in FFXI_FED_WORLDS): our own world only")
+    # In-game notices (login message lines, system-chat announcements) and their calendar
+    # sync; sets NOTICES for the admin tool's Notices page below. Logs and stays off without
+    # the LSB database.
+    import ffxi_notices
+    ffxi_notices.start(sys.modules[__name__])
+    # What the game has scheduled (the map module's calendar table and the Bonanza runs), for the
+    # core's news posts (services/ffxinews.py). Logs and stays off without the LSB database.
+    try:
+        import ffxi_calendar
+    except ImportError as exc:
+        log("boot", f"game calendar feed OFF: {exc}")
+    else:
+        ffxi_calendar.start(sys.modules[__name__])
     import ffxi_fedtool
     if ffxi_fedtool.start(sys.modules[__name__]) is None:
         log("boot", "federation admin tool OFF (FFXI_FEDTOOL_PORT unset)")

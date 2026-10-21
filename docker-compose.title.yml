@@ -18,9 +18,10 @@
 # (POL_DATABASE_URL, which login and authsess already have), so nothing here
 # names a file or a database.
 #
-# Stacking titles: every title image is the core image plus one plugin, so
-# to run several, build each on the previous one (OPENLOBBY_IMAGE) and list
-# them all in POL_TITLES, e.g. POL_TITLES=tmtitle,ffxititle in .env.
+# Stacking titles: every title image is the image below it plus one plugin.
+# OpenLobby's tools/stack.py builds the chain in order, passing each link's
+# base in POL_TITLE_BASE_IMAGE, and sets POL_TITLES to every enabled title
+# (OpenLobby's docs/games.md). Run alone, this builds on OPENLOBBY_IMAGE.
 
 services:
   login:
@@ -29,7 +30,7 @@ services:
       context: ../hippaulbridge/lsb
       dockerfile: Dockerfile.title
       args:
-        OPENLOBBY_IMAGE: "${OPENLOBBY_IMAGE:-openlobby:latest}"
+        OPENLOBBY_IMAGE: "${POL_TITLE_BASE_IMAGE:-${OPENLOBBY_IMAGE:-openlobby:latest}}"
     pull_policy: build
     environment:
       POL_TITLES: "${POL_TITLES:-ffxititle}"
@@ -37,6 +38,9 @@ services:
       # FFXI Content IDs per handle, one per character (default 1; see the
       # README before raising it: eight per handle across every title)
       POL_FFXI_CHARACTER_SLOTS: "${POL_FFXI_CHARACTER_SLOTS:-}"
+      # FFXI characters per member in all (default 16); the ones past the
+      # primary handle go on extra handles holding only FFXI (see the README)
+      POL_FFXI_MEMBER_SLOTS: "${POL_FFXI_MEMBER_SLOTS:-}"
 
   authsess:
     image: hippaulbridge-title:latest
@@ -45,6 +49,7 @@ services:
       POL_TITLES: "${POL_TITLES:-ffxititle}"
       POL_FFXI_WORLD_ID: "${POL_FFXI_WORLD_ID:-0x20}"
       POL_FFXI_CHARACTER_SLOTS: "${POL_FFXI_CHARACTER_SLOTS:-}"
+      POL_FFXI_MEMBER_SLOTS: "${POL_FFXI_MEMBER_SLOTS:-}"
       # 1: a friend's row says which FFXI character they are playing, from
       # the bridge's in-world feed. Off by default (see the README).
       POL_FFXI_INGAME_PUSH: "${POL_FFXI_INGAME_PUSH:-}"

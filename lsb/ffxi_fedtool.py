@@ -12,6 +12,23 @@ Manages both directions of FFXI federation from one page, live:
     identity.key sits in the same directory and is never touched.
   - OUR OWN IDS, to hand to other operators: our provider id and key set, and our world's.
 
+A second page, /notices, is the in-game notices tool (ffxi_notices.py): the lines the login
+message carries and the system-chat announcements, posted now, later or as a countdown to a
+shutdown. Its page and routes all start with /notices and share nothing with the federation's.
+
+A third, /bonanza, manages the Mog Bonanza runs (ffxi_bonanza.py); its routes start with
+/bonanza and it reads and writes the LSB database directly.
+
+A fourth, /chars, looks up and fixes characters (ffxi_chars.py): move one, take off its
+equipment, edit its character variables, give it items, copy one onto a test character, and
+undo any of it. Its routes start with /chars and it reads and writes the LSB database directly.
+
+A fifth, /ah, lists and changes the auction house (ffxi_auction.py): prices, taking a listing
+down, test listings. Its routes start with /ah and it reads and writes the LSB database directly.
+
+A sixth, /events, switches the seasonal festivals on, off or back to their calendar (ffxi_events.py),
+server-wide. Its routes start with /events and it reads and writes the LSB database directly.
+
 The panel (OpenLobby admingames, key "ffxi") proxies this port under /games/ffxi/ behind its
 sign-in; this port only checks the panel's token (X-Devtool-Token, or ?t= when opened
 directly) and logs the panel's actor (X-Devtool-Actor). Same contract as the FE and FMO tools.
@@ -32,10 +49,16 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import ffxi_auction as A
+import ffxi_bonanza as B
+import ffxi_chars as C
+import ffxi_events as E
 import ffxi_federation as F
+import ffxi_notices as N
 import xitoken as X
 
 _LOG = collections.deque(maxlen=200)
+_NLOG = collections.deque(maxlen=200)
 _LOCK = threading.Lock()
 _ID = re.compile(r"xi1\.[A-Za-z0-9_-]{22}\Z")
 
@@ -138,11 +161,11 @@ class Tool:
 
     # -- actions -------------------------------------------------------------------------------
 
-    def _note(self, actor, line):
+    def _note(self, actor, line, log=_LOG, tag="fedtool"):
         text = time.strftime("%Y-%m-%d %H:%M:%SZ ", time.gmtime()) + (actor or "someone") + ": " + line
         with _LOCK:
-            _LOG.append(text)
-        self.bridge.log("fedtool", text)
+            log.append(text)
+        self.bridge.log(tag, text)
 
     def _fetch_keyset(self, source, pin=None):
         source = (source or "").strip()
@@ -250,8 +273,313 @@ class Tool:
         self._note(actor, "stopped trusting provider %s" % sid)
         return {"ok": True, "msg": "Removed. Our world stops accepting its players within a minute."}
 
+    # -- in-game notices (the /notices page) --------------------------------------------------
+
+    def _store(self):
+        store = getattr(self.bridge, "NOTICES", None)
+        if store is None:
+            why = getattr(self.bridge, "NOTICES_OFF", None) or "not started"
+            raise ToolError("In-game notices are off on the bridge (%s)." % why)
+        return store
+
+    def notices_state(self, now=None):
+        now = int(time.time() if now is None else now)
+        sync = getattr(self.bridge, "NOTICES_SYNC", None)
+        with _LOCK:
+            log = list(_NLOG)
+        out = {"now": now, "countdown": list(N.COUNTDOWN_MIN), "motd_max": N.MOTD_MAX,
+               "announce_max": N.ANNOUNCE_MAX, "log": log,
+               "calendar": {"on": bool(sync), "games": [N.GAME_NAMES.get(g, g) for g in sync.games] if sync else [],
+                            "last": sync.last if sync else None, "error": sync.error if sync else None}}
+        store = getattr(self.bridge, "NOTICES", None)
+        if store is None:
+            out["off"] = getattr(self.bridge, "NOTICES_OFF", None) or "not started"
+            out["motd"], out["announce"] = [], []
+            return out
+        try:
+            rows = store.rows(now)
+        except Exception as exc:
+            out["error"] = "Could not read the notices table: %s" % exc
+            rows = []
+        for r in rows:
+            r["state"] = N.describe(r, now)
+            r["calendar"] = (r.get("tag") or "").startswith(N.CALENDAR_TAG)
+        # Login lines in the order the module puts them in the message; announcements by time.
+        out["motd"] = sorted((r for r in rows if r["kind"] == "motd"), key=lambda r: (r.get("sort") or 0, r["id"]))
+        out["announce"] = sorted((r for r in rows if r["kind"] == "announce"), key=lambda r: (r["starts_at"], r["id"]))
+        return out
+
+    def notices_announce(self, body, actor):
+        store, now = self._store(), int(time.time())
+        try:
+            starts = N.add_announce(store, body.get("text"), body.get("at"), actor, now,
+                                    body.get("every") or 0, body.get("times") or 1, bool(body.get("urgent")))
+        except N.NoticeError as exc:
+            raise ToolError(str(exc))
+        later = starts[0] > now + 15
+        when = N.utc(starts[0], "%Y-%m-%d %H:%M")
+        self._note(actor, "announcement %s%s: %s" % (
+            "at " + when if later else "now", " (%d times)" % len(starts) if len(starts) > 1 else "",
+            N.clean(body.get("text"), N.ANNOUNCE_MAX)), _NLOG, "notices")
+        return {"ok": True, "starts": starts,
+                "msg": "Scheduled for %s." % when if later else "Queued. It goes out within 15 seconds."}
+
+    def notices_countdown(self, body, actor):
+        store, now = self._store(), int(time.time())
+        leads = body.get("leads") or N.COUNTDOWN_MIN
+        try:
+            leads = [int(x) for x in (leads.replace(",", " ").split() if isinstance(leads, str) else leads)]
+            if not leads or any(m < 1 or m > 24 * 60 for m in leads):
+                raise ValueError
+        except (TypeError, ValueError):
+            raise ToolError("Warning times are minutes before the shutdown, like 30, 10, 5, 1.")
+        try:
+            down, rows, added = N.add_countdown(store, body.get("down_at"), actor, now, leads)
+        except N.NoticeError as exc:
+            raise ToolError(str(exc))
+        when = N.utc(down, "%Y-%m-%d %H:%M")
+        self._note(actor, "countdown to %s (%s)" % (when, ", ".join(r["tag"].rsplit(":", 1)[1] for r in rows)
+                                                    + " min"), _NLOG, "notices")
+        return {"ok": True, "msg": "%d warning%s before the shutdown at %s.%s" % (
+            len(rows), "" if len(rows) == 1 else "s", when,
+            "" if added == len(rows) else " Some of them were already scheduled.")}
+
+    def notices_motd(self, body, actor):
+        store, now = self._store(), int(time.time())
+        try:
+            end = N.add_motd(store, body.get("text"), body.get("until"), actor, now)
+        except N.NoticeError as exc:
+            raise ToolError(str(exc))
+        self._note(actor, "login line added%s: %s" % (
+            " until " + N.utc(end, "%Y-%m-%d %H:%M") if end else "", N.clean(body.get("text"), N.MOTD_MAX)),
+            _NLOG, "notices")
+        return {"ok": True, "msg": "Added. Players see it at their next login, or with /servmes."}
+
+    def _id(self, body):
+        try:
+            return int(body.get("id"))
+        except (TypeError, ValueError):
+            raise ToolError("Which one? The request named no row.")
+
+    def notices_end(self, body, actor):
+        rid = self._id(body)
+        if not self._store().end_motd(rid, int(time.time())):
+            raise ToolError("That line is not showing.")
+        self._note(actor, "ended login line %d" % rid, _NLOG, "notices")
+        return {"ok": True, "msg": "Ended. New logins no longer see it."}
+
+    def notices_cancel(self, body, actor):
+        rid = self._id(body)
+        if not self._store().cancel_id(rid):
+            raise ToolError("That announcement has already gone out, or is not there.")
+        self._note(actor, "cancelled announcement %d" % rid, _NLOG, "notices")
+        return {"ok": True, "msg": "Cancelled. It will not be sent."}
+
+    def notices_delete(self, body, actor):
+        rid = self._id(body)
+        if not self._store().delete_id(rid):
+            raise ToolError("Sent announcements stay in the list; only login lines and unsent "
+                            "announcements can be removed.")
+        self._note(actor, "removed notice %d" % rid, _NLOG, "notices")
+        return {"ok": True, "msg": "Removed."}
+
     ACTIONS = {"/worlds/add": "add_world", "/worlds/remove": "remove_world", "/worlds/check": "check_world",
-               "/providers/add": "add_provider", "/providers/remove": "remove_provider"}
+               "/providers/add": "add_provider", "/providers/remove": "remove_provider",
+               "/notices/announce": "notices_announce", "/notices/countdown": "notices_countdown",
+               "/notices/motd": "notices_motd", "/notices/end": "notices_end",
+               "/notices/cancel": "notices_cancel", "/notices/delete": "notices_delete"}
+
+
+# -- Mog Bonanza (the /bonanza page, ffxi_bonanza.py) ----------------------------------------------
+
+_BONANZA = []
+
+
+def _bonanza():
+    """The Bonanza page's actions, made on first use; ToolError without the LSB database."""
+    if not _BONANZA:
+        got, why = B.open_store()
+        if got is None:
+            raise ToolError("The Bonanza page needs the LSB database (%s)." % why)
+        _BONANZA.append(got)
+    return _BONANZA[0]
+
+
+def _bonanza_action(name):
+    def action(self, body, actor):
+        try:
+            return getattr(_bonanza(), name)(body, actor)
+        except (ToolError, B.BonanzaError) as exc:
+            raise ToolError(str(exc))
+        except Exception as exc:
+            # pymysql's errors: the LSB database refused or is down.
+            raise ToolError("The LSB database said: %s" % exc)
+    return action
+
+
+for _path, _name in B.ACTIONS.items():
+    setattr(Tool, "bonanza_" + _name, _bonanza_action(_name))
+    Tool.ACTIONS[_path] = "bonanza_" + _name
+
+
+def bonanza_get(path, query):
+    """GET /bonanza.json (the page's state) and /bonanza/winners.json?id=&rank= -> (status, obj)."""
+    try:
+        if path == "/bonanza.json":
+            return 200, _bonanza().state()
+        return 200, _bonanza().winners(urllib.parse.parse_qs(query))
+    except (ToolError, B.BonanzaError) as exc:
+        return 503, {"error": str(exc)}
+    except Exception as exc:
+        return 503, {"error": "The LSB database said: %s" % exc}
+
+
+# -- Characters (the /chars page, ffxi_chars.py) ---------------------------------------------------
+
+_CHARS = []
+
+
+def _chars():
+    """The Characters page's actions, made on first use; ToolError without the LSB database."""
+    if not _CHARS:
+        got, why = C.open_store()
+        if got is None:
+            raise ToolError("The Characters page needs the LSB database (%s)." % why)
+        _CHARS.append(got)
+    return _CHARS[0]
+
+
+def _chars_action(name):
+    def action(self, body, actor):
+        try:
+            return getattr(_chars(), name)(body, actor)
+        except (ToolError, C.CharError) as exc:
+            raise ToolError(str(exc))
+        except Exception as exc:
+            # pymysql's errors: the LSB database refused or is down.
+            raise ToolError("The LSB database said: %s" % exc)
+    return action
+
+
+for _path, _name in C.ACTIONS.items():
+    setattr(Tool, "chars_" + _name, _chars_action(_name))
+    Tool.ACTIONS[_path] = "chars_" + _name
+
+
+def chars_get(path, query):
+    """GET /chars.json (the page's state), /chars/search.json?q=, /chars/char.json?id= and
+    /chars/arrivals.json?to= (the zones with a zone line into a zone, and its heavy cutscenes),
+    /chars/data.json?id= (the character's data summary beside the test character's) and
+    /chars/items.json?q= (items to give, by name or id) -> (status, obj)."""
+    try:
+        if path == "/chars.json":
+            return 200, _chars().state()
+        args = urllib.parse.parse_qs(query)
+        if path == "/chars/search.json":
+            return 200, _chars().search(args)
+        if path == "/chars/arrivals.json":
+            return 200, _chars().arrivals(args)
+        if path == "/chars/data.json":
+            return 200, _chars().data(args)
+        if path == "/chars/items.json":
+            return 200, _chars().item_search(args)
+        return 200, _chars().detail(args)
+    except C.CharError as exc:
+        return 400, {"error": str(exc)}
+    except ToolError as exc:
+        return 503, {"error": str(exc)}
+    except Exception as exc:
+        return 503, {"error": "The LSB database said: %s" % exc}
+
+
+# -- Auction house (the /ah page, ffxi_auction.py) ------------------------------------------------
+
+_AH = []
+
+
+def _ah():
+    """The Auction house page's actions, made on first use; ToolError without the LSB database."""
+    if not _AH:
+        got, why = A.open_store()
+        if got is None:
+            raise ToolError("The Auction house page needs the LSB database (%s)." % why)
+        _AH.append(got)
+    return _AH[0]
+
+
+def _ah_action(name):
+    def action(self, body, actor):
+        try:
+            return getattr(_ah(), name)(body, actor)
+        except (ToolError, A.AuctionError) as exc:
+            raise ToolError(str(exc))
+        except Exception as exc:
+            # pymysql's errors: the LSB database refused or is down.
+            raise ToolError("The LSB database said: %s" % exc)
+    return action
+
+
+for _path, _name in A.ACTIONS.items():
+    setattr(Tool, "ah_" + _name, _ah_action(_name))
+    Tool.ACTIONS[_path] = "ah_" + _name
+
+
+def ah_get(path, query):
+    """GET /ah.json?q= (listings for sale and sold, counts and the log) and /ah/items.json?q=
+    (items to post, by name or id) -> (status, obj)."""
+    try:
+        args = urllib.parse.parse_qs(query)
+        if path == "/ah/items.json":
+            return 200, _ah().item_search(args)
+        return 200, _ah().state(args)
+    except A.AuctionError as exc:
+        return 400, {"error": str(exc)}
+    except ToolError as exc:
+        return 503, {"error": str(exc)}
+    except Exception as exc:
+        return 503, {"error": "The LSB database said: %s" % exc}
+
+
+# -- Seasonal events (the /events page, ffxi_events.py) --------------------------------------------
+
+_EV = []
+
+
+def _events():
+    """The Seasonal events page's actions, made on first use; ToolError without the LSB database."""
+    if not _EV:
+        got, why = E.open_store()
+        if got is None:
+            raise ToolError("The Seasonal events page needs the LSB database (%s)." % why)
+        _EV.append(got)
+    return _EV[0]
+
+
+def _events_action(name):
+    def action(self, body, actor):
+        try:
+            return getattr(_events(), name)(body, actor)
+        except (ToolError, E.EventsError) as exc:
+            raise ToolError(str(exc))
+        except Exception as exc:
+            # pymysql's errors: the LSB database refused or is down.
+            raise ToolError("The LSB database said: %s" % exc)
+    return action
+
+
+for _path, _name in E.ACTIONS.items():
+    setattr(Tool, "events_" + _name, _events_action(_name))
+    Tool.ACTIONS[_path] = "events_" + _name
+
+
+def events_get():
+    """GET /events.json (every festival's switch, season and the log) -> (status, obj)."""
+    try:
+        return 200, _events().state()
+    except ToolError as exc:
+        return 503, {"error": str(exc)}
+    except Exception as exc:
+        return 503, {"error": "The LSB database said: %s" % exc}
 
 
 def make_handler(tool, token):
@@ -288,6 +616,27 @@ def make_handler(tool, token):
                 return self._send(200, PAGE, "text/html; charset=utf-8")
             if path == "/fed.json":
                 return self._json(200, tool.state())
+            if path == "/notices":
+                return self._send(200, N.PAGE, "text/html; charset=utf-8")
+            if path == "/notices.json":
+                return self._json(200, tool.notices_state())
+            if path == "/bonanza":
+                return self._send(200, B.PAGE, "text/html; charset=utf-8")
+            if path in ("/bonanza.json", "/bonanza/winners.json"):
+                return self._json(*bonanza_get(path, urllib.parse.urlsplit(self.path).query))
+            if path == "/chars":
+                return self._send(200, C.PAGE, "text/html; charset=utf-8")
+            if path in ("/chars.json", "/chars/search.json", "/chars/char.json", "/chars/arrivals.json",
+                        "/chars/data.json", "/chars/items.json"):
+                return self._json(*chars_get(path, urllib.parse.urlsplit(self.path).query))
+            if path == "/ah":
+                return self._send(200, A.PAGE, "text/html; charset=utf-8")
+            if path in ("/ah.json", "/ah/items.json"):
+                return self._json(*ah_get(path, urllib.parse.urlsplit(self.path).query))
+            if path == "/events":
+                return self._send(200, E.PAGE, "text/html; charset=utf-8")
+            if path == "/events.json":
+                return self._json(*events_get())
             return self._json(404, {"error": "not found"})
 
         def do_POST(self):
@@ -311,6 +660,11 @@ def make_handler(tool, token):
                 return self._json(200, {"ok": False, "msg": str(exc)})
             except OSError as exc:
                 return self._json(500, {"ok": False, "msg": "Could not write: %s" % exc})
+            except Exception as exc:
+                # pymysql's errors are not OSErrors: the LSB database refused or is down.
+                if not path.startswith("/notices/"):
+                    raise
+                return self._json(500, {"ok": False, "msg": "The LSB database said: %s" % exc})
 
     return Handler
 

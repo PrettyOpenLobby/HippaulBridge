@@ -468,6 +468,57 @@ check(B._charfields.get("37", {}).get("race") == 7,
       f"race 0 in LSB's cached record is not recorded ({B._charfields.get('37')})")
 
 # ---------------------------------------------------------------------------
+print("\n== the credential blob in 0x26 names the login (SE's mechanism)")
+import contentauth  # noqa: E402  (the core's, via openlobby_paths)
+sys.path.insert(0, os.path.join(os.path.dirname(contentauth.__file__), os.pardir, "tools"))
+import polfilecrypt  # noqa: E402
+
+
+def blob_for(h):
+    """A 52-byte credential carrying hash `h`, built the way polcore builds it."""
+    plain = bytearray(40)
+    plain[4:8] = b"\x01\0\0\0"
+    plain[24:40] = h
+    plain[0] = plain[27] ^ plain[37]
+    enc = polfilecrypt.encrypt(bytes(plain), polfilecrypt.KEY_REC48)
+    b = bytearray(52)
+    b[4:52] = enc
+    for i in range(5, 52):
+        b[i] ^= b[i - 1]
+    b[0] = b[14] ^ 0x5A
+    b[1] = b[6] ^ b[12]
+    b[2] = b[8] ^ b[10]
+    b[3] = b[9] ^ b[13]
+    return bytes(b)
+
+
+def pkt26(blob):
+    p = bytearray(152)
+    struct.pack_into("<I", p, 0, 152)
+    p[4:8] = b"IXFF"
+    p[8] = 0x26
+    p[28 + 24:28 + 24 + 52] = blob
+    return bytes(p)
+
+
+hcred = contentauth.hash_for(b"\0" * 16, 0x68E6A5B8, b"\0" * 8)
+check(B.member_for_credential(pkt26(blob_for(hcred))) == (None, None),
+      "a blob whose hash nobody filed names nobody (the heuristics run instead)")
+contentauth.file_hashes([hcred], 42, "uCRED", 1, "192.0.2.9")
+check(B.member_for_credential(pkt26(blob_for(hcred))) == (42, "uCRED"),
+      "the same blob names member 42 once the lobby has filed its 4:5 hash")
+other = bytearray(pkt26(blob_for(hcred)))
+other[8] = 0x1F
+check(B.member_for_credential(bytes(other)) == (None, None),
+      "only 0x26 is read for a credential")
+check(B.member_for_credential(pkt26(blob_for(hcred))[:100]) == (None, None),
+      "a first segment that stops short of the blob is not misread")
+garbage = bytearray(pkt26(blob_for(hcred)))
+garbage[60] ^= 0x80
+check(B.member_for_credential(bytes(garbage)) == (None, None),
+      "a corrupted blob is refused by the trailer checksum")
+
+# ---------------------------------------------------------------------------
 shutil.rmtree(TMP, ignore_errors=True)
 if FAILS:
     print(f"\nFAIL: {len(FAILS)} check(s):")

@@ -16,3 +16,10 @@ COPY ffxi_migrations /app/ffxi_migrations
 COPY ffxititle.py /app/ffxititle.py
 
 ENV POL_TITLES=ffxititle
+
+# This image is the one that runs: login, authsess and discordbridge. The
+# login process also serves the ISP-type mail ports, POP3 110 and SMTP 25
+# (core/main.py, POL_POP3_PORT and POL_SMTP_PORT), and those are privileged,
+# so it stays root like the core image. A first cut switched it to uid 1000
+# and both binds failed with EACCES while every other listener came up.
+USER root

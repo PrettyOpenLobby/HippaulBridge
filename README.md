@@ -43,16 +43,21 @@ The core builds the profile the Viewer shows for a FINAL FANTASY XI Content ID f
 data only this title holds, so a small plugin runs inside the core's `login`
 and `authsess` processes (OpenLobby's `services/titles.py`, `POL_TITLES`).
 `lsb/Dockerfile.title` layers it on the core image and `docker-compose.title.yml`
-swaps that image into those two services. From this directory, with the core
-checked out beside it:
+swaps that image into those two services. The bring-up below includes it.
+To rebuild only those two, from this directory:
 
 ```
-docker compose --project-directory ../openlobby     -f ../openlobby/docker-compose.yml -f docker-compose.title.yml     up -d --build login authsess
+docker compose --project-directory ../openlobby \
+    -f ../openlobby/docker-compose.yml -f docker-compose.title.yml \
+    up -d --build login authsess
 ```
 
-Without it the core still logs FFXI accounts in and lists their characters, but serves them with no world identity, and the world connect fails with POL-0001; the plugin also fills the profile's world, nation, zone, job and race from the bridge's id map. To run several titles, build each title image on the previous
-one (`OPENLOBBY_IMAGE`) and list them all in `POL_TITLES` in OpenLobby's
-`.env`, for example `POL_TITLES=tmtitle,ffxititle`.
+Without it the core still logs FFXI accounts in and lists their characters,
+but serves them with no world identity, and the world connect fails with
+POL-0001; the plugin also fills the profile's world, nation, zone, job and
+race from the bridge's id map. With other games enabled, run
+`python ../openlobby/tools/stack.py compose up -d --build` instead: it builds
+each title image on the previous one and lists every plugin in `POL_TITLES`.
 
 ## Prerequisites
 
@@ -60,8 +65,7 @@ one (`OPENLOBBY_IMAGE`) and list them all in `POL_TITLES` in OpenLobby's
   look for it (`git clone https://github.com/PrettyOpenLobby/HippaulBridge.git hippaulbridge`).
   A checkout from before the rename, still named `crystalbridge`, needs renaming.
 - Docker with Compose v2
-- OpenLobby checked out beside this repository as `../openlobby`, with its
-  image built (`docker compose build` there, which tags `openlobby:latest`).
+- OpenLobby checked out beside this repository as `../openlobby`.
   This stack runs in OpenLobby's compose project: the bridge image is built on
   the core image, and the bridge keeps its state in the core's PostgreSQL
   (the `ffxi_*` tables, created by the bridge at start) and reads the accounts
@@ -94,26 +98,49 @@ its data; pin it by digest yourself if you want reproducibility there too.
 
 **2. Configure and start.**
 
+From this directory:
+
 ```
-cp .env.example .env      # set LSB_ADVERTISE_IP and change every password
-docker compose --project-directory ../openlobby \
-    --env-file ../openlobby/.env --env-file .env \
-    -f ../openlobby/docker-compose.yml -f docker-compose.yml \
-    up -d --build db db-update db-zoneip connect search world map bridge
+cp .env.example .env      # change every password
+python ../openlobby/tools/stack.py enable ffxi
+python ../openlobby/tools/stack.py compose up -d --build
 ```
 
-OpenLobby's `.env` comes first so its `POL_DB_PASSWORD` reaches the bridge's
-database URL. The rest of this README writes `docker compose` for that whole
-invocation (the project directory, both env files and both compose files).
-
-Without building the bridge image (published to
-`ghcr.io/prettyopenlobby/hippaulbridge` on every push), add
-`-f docker-compose.ghcr.yml` after the other two files.
+`stack.py` is OpenLobby's launcher for the core and its games (OpenLobby's
+docs/games.md): it remembers which games you enabled, runs them in the
+core's compose project with OpenLobby's `.env` first (so its
+`POL_DB_PASSWORD` reaches the bridge's database URL) and this one second,
+and when several games plug into `login` it builds their images one on
+another and lists them all in `POL_TITLES`.
+`python ../openlobby/tools/stack.py check` says whether the mesh volumes of
+step 1 exist.
 
 The first start imports LSB's schema (a minute or two; `db-update` runs
-once and exits) and points every zone at `LSB_ADVERTISE_IP`. `LSB_ADVERTISE_IP`
-must be an address the FFXI client can route to; the default 127.0.0.1 works
-only for a client on the same machine.
+once and exits) and points every zone at `LSB_ADVERTISE_IP`. That address
+must be one the FFXI client can route to. Empty, it is the core's
+`POL_ADVERTISE` (OpenLobby's `.env`), and 127.0.0.1, which works only for a
+client on the same machine, when that is empty too.
+
+The rest of this README writes `docker compose` for the whole invocation:
+`python ../openlobby/tools/stack.py compose` does it for you, and by hand,
+for FFXI alone, it is
+
+```
+docker compose --project-directory ../openlobby \
+    --env-file ../openlobby/.env --env-file .env \
+    -f ../openlobby/docker-compose.yml \
+    -f docker-compose.yml -f docker-compose.title.yml
+```
+
+(compose refuses an `--env-file` that does not exist, and the bridge image
+is built on `openlobby:latest`, so build the core first by hand with
+`docker compose build` in `../openlobby`).
+
+Without building the bridge image (published to
+`ghcr.io/prettyopenlobby/hippaulbridge` on every push), use
+`python ../openlobby/tools/stack.py compose --ghcr up -d`, or add
+`-f docker-compose.ghcr.yml` after the other files by hand. The title
+plugin's small image is still built locally.
 
 **3. Check.** `docker compose ps` shows db, connect, search, world, map and
 bridge up, and `docker compose logs bridge` ends with `startup auth OK` (or
@@ -181,7 +208,22 @@ page or the admin panel. A handle can hold at most eight Content IDs across
 all titles, and OpenLobby never mints or serves a ninth: the Viewer refuses to
 open FFXI on a handle it thinks is over that limit. On a handle granted every
 title, one FFXI character is all there is room for; raise the setting only for
-handles holding fewer titles. FFXI must also be listed in OpenLobby's
+handles holding fewer titles.
+
+A member can still have up to `POL_FFXI_MEMBER_SLOTS` FFXI characters in all
+(default 16, as on retail). The ones past the primary handle's share go on
+extra handles that hold nothing but FFXI, eight to a handle, so the primary
+handle and the other titles on it never change. Nobody has to ask for them:
+once every FFXI slot a member has is taken by a character, their next login
+creates the next handle (named after the primary one: `Lex` gets `Lex2`) and
+gives it eight empty slots, which FFXI's character select then offers. A player
+who only ever makes one character never sees a second handle. The client
+allows four handles per member, so a member who already has four gets no extra
+slots. A handle with a character on one of its Content IDs cannot be deleted,
+and moving a character to another handle moves only that character's Content
+ID. Set `POL_FFXI_MEMBER_SLOTS=1` to turn all of this off.
+
+FFXI must also be listed in OpenLobby's
 `POL_LOBBY_CONTENT_IDS` for the Play button to appear; the default list
 includes it.
 
@@ -297,6 +339,33 @@ so they are mounted for the one command): `ffxi_provision.py list|create|rehome`
 `ffxi_names.py` (copies the character names the bridge has seen into
 OpenLobby's `content_character` table, and looks them up).
 
+## The admin panel's FFXI pages
+
+The bridge serves the pages under Games > FFXI in OpenLobby's admin panel
+from its own small HTTP port, `FFXI_FEDTOOL_PORT` (unset means off; the
+shipped compose file leaves it unset). It binds 127.0.0.1 unless
+`FFXI_FEDTOOL_BIND` says otherwise, and a wider bind needs
+`FFXI_FEDTOOL_TOKEN`, the same value as the panel's
+`POL_ADMIN_GAME_FFXI_TOKEN`. Every page except Federation reads and writes
+the LSB database directly, with the bridge's `LSB_DB_*` settings.
+
+Characters (find a character, move it, take off equipment, edit its
+variables, give items, copy it onto a test character, undo) and Auction house
+work on a stock LandSandBoat world.
+
+Other pages only write rows for a map-server module to act on, and stock
+LandSandBoat has no such module; this repository does not include one either.
+On a stock world they save what you enter and nothing happens in game:
+
+- Notices (login message lines, announcements, a maintenance countdown) and
+  their calendar sync;
+- Mog Bonanza, which reports its tables as missing;
+- Seasonal events, the per-festival on/off/auto switches;
+- on the Characters page, the console cutscene switches, the console test
+  flags, the test scenarios and the zone trail in the lost-contact list;
+- the game-calendar feed (`ffxi_calendar.py`) behind OpenLobby's FFXI news
+  posts, which hands over an empty list.
+
 ## Ports
 
 | host port | proto | owner | role |
@@ -403,7 +472,8 @@ python tools/gen_ffxi_lsb_tables.py --lsb path/to/lsb-server --check  # is it st
 
 - No Square Enix files: no client, no Viewer, no game data. LSB's images and
   mesh data are the LSB team's own and are pulled from their registry.
-- No world server code: LSB is upstream and unmodified.
+- No world server code: LSB is upstream and unmodified. The admin pages
+  listed above as needing a map-server module are inert without one.
 - No client-side helper: the session stamp and the self-serve import endpoint
   are supported by the bridge, but the client half is not part of this
   repository. Everything works without it.
@@ -411,10 +481,11 @@ python tools/gen_ffxi_lsb_tables.py --lsb path/to/lsb-server --check  # is it st
 
 ## License
 
-GPL-3.0 (see LICENSE and NOTICE). Two files are derived from LandSandBoat,
-which is GPL-3.0: `lsb/ffxi_lsb_tables.py` is generated from its source, and
-`tools/ffxi_bfdiff/common/cbasetypes.h` is a verbatim excerpt of one of its
-headers. The whole repository therefore carries the same license.
+GPL-3.0 (see LICENSE and NOTICE). Three files are derived from LandSandBoat,
+which is GPL-3.0: `lsb/ffxi_lsb_tables.py` is generated from its source,
+`lsb/ffxi_testdata.json` from its zone and zone-line data
+(`tools/gen_ffxi_testdata.py`), and `tools/ffxi_bfdiff/common/cbasetypes.h` is
+a verbatim excerpt of one of its headers. The whole repository therefore carries the same license.
 
 ## Credits
 

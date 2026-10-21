@@ -87,14 +87,14 @@ class FakeConn:
         pass
 
 
-def row(hid, charid, message, name="Bluebell", zone="Southern San d'Oria",
+def row(hid, charid, message, name="Marigold", zone="Southern San d'Oria",
         login="pol7", addr=0x0100007F):
     return (hid, charid, message, "2026-10-02 03:00:00", name, 7, 230, zone,
             login, addr)
 
 
 HANDLES = {
-    4201: {"id": 11, "handle_name": "Bluebell", "client_guid": 0x253953FBA4,
+    4201: {"id": 11, "handle_name": "Marigold", "client_guid": 0x253953FBA4,
            "member_id": 7},
 }
 IDMAP = {"1001": 4201}
@@ -153,9 +153,9 @@ def test_build_ticket():
     rec = G.build_ticket(r, HANDLES[4201], 42, "#gmcall042", now=0)
     check(rec["request_no"] == 42 and rec["content_id"] == 1, "request number and FFXI content code")
     check(rec["guid"] == 0x253953FBA4, "guid is the handle's client id (how gmd knows the caller)")
-    check(rec["handle"] == "Bluebell", "handle name for the desk")
+    check(rec["handle"] == "Marigold", "handle name for the desk")
     check(rec["body"].startswith("I am stuck in a wall"), "the player's text leads the body")
-    check("Bluebell in Southern San d'Oria" in rec["body"], "character and zone named")
+    check("Marigold in Southern San d'Oria" in rec["body"], "character and zone named")
     check(rec["peer"] == "127.0.0.1:0", "client_addr (host-order int) -> ip:0")
     check(rec["room"] == "#gmcall042" and rec["source"] == G.SOURCE, "room and source")
     check(rec["ffxi"]["help_desk_id"] == 5 and rec["ffxi"]["charid"] == 1001
@@ -181,7 +181,7 @@ def test_file_calls():
         names = sorted(n for n in os.listdir(d) if G.TICKET_RE.fullmatch(n))
         check(len(filed) == 2 and len(names) == 2, "two calls -> two tickets")
         check([f["request_no"] for f in filed] == [1, 2], "numbered 1, 2 from gmd's counter")
-        check(filed[0]["handle"] == "Bluebell" and filed[1]["handle"] == "",
+        check(filed[0]["handle"] == "Marigold" and filed[1]["handle"] == "",
               "paired character named, unpaired one filed unnamed")
         check(relay.file_calls(conn, now=0) == [], "nothing new -> nothing filed")
         with open(os.path.join(d, G.OWN_STATE_NAME)) as f:

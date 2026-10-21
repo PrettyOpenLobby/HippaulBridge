@@ -645,6 +645,152 @@ check(all(rec[4] for rec in served9), "9d. every served record is bound")
 
 # --------------------------------------------------------------------------- #
 print()
+print("10. A FULL SET OF CHARACTERS WITHOUT TOUCHING THE PRIMARY HANDLE")
+
+# A member granted every title has one FFXI id on the primary handle and no
+# room for a second there. The rest go on handles holding only FFXI, created
+# at login once every slot is spent (accounts.ensure_overflow_slots).
+TITLE.member_slots = 16
+try:
+    ov = fresh_db("overflow-handles")
+    A.create_polid(ov, "OVHAND", "pw-account")
+    vmid = A.add_member(ov, "OVHAND", "ovhand", "pw-member")
+    A.set_handle(ov, vmid, "Lexborrowdale")
+    vhid = A.primary_handle_row(ov, vmid)["id"]
+    for code in (1, 2, 3, 4, 10, 11, 14, 15):
+        A.grant_content(ov, vmid, code)
+    A.link_member_content_to_primary(ov, vmid)
+    use_db("overflow-handles")
+    ffxidb.write_idmap([], replace=True)          # the bridge has run, no characters
+
+    def primary_links():
+        return [(int(r["content_code"]), int(r["slot"]), r["content_id"])
+                for r in A.handle_content_list(ov, vhid, active_only=False)]
+
+    def handle_rows():
+        return [(int(r["id"]), r["handle_name"]) for r in ov.execute(
+            "SELECT id, handle_name FROM handle WHERE member_id = %s ORDER BY id",
+            (vmid,)).fetchall()]
+
+    def member_ffxi():
+        return [int(x) for x in A.member_content_id_list(ov, vmid, X.CONTENT_CODE)]
+
+    def put_characters(ids):
+        ffxidb.write_idmap([{"charid": 100 + i, "content_id": cid, "name": "C%d" % i,
+                             "world_field": 1, "seen": "2026-10-17T00:00:00Z"}
+                            for i, cid in enumerate(ids)], replace=True)
+
+    before = primary_links()
+    check(len(before) == 8, "the primary handle is at the ceiling (%d)" % len(before))
+
+    got = A.ensure_title_slots(ov, member_id=vmid)
+    check(got == 0 and len(handle_rows()) == 1,
+          "10a. with a slot still free, a login adds nothing (%d minted, %d handles)"
+          % (got, len(handle_rows())))
+
+    put_characters(member_ffxi())                 # the one slot is now a character
+    got = A.ensure_title_slots(ov, member_id=vmid)
+    hs = handle_rows()
+    check(got == 8 and len(hs) == 2 and hs[1][1] == "Lexborrowdale2",
+          "10b. every slot spent: the next login makes Lexborrowdale2 with 8 slots"
+          " (%d minted, %s)" % (got, hs))
+    check(primary_links() == before,
+          "10c. the primary handle is exactly as it was, ids and all")
+    h2 = hs[1][0]
+    check({int(r["content_code"]) for r in A.handle_content_list(ov, h2)} == {1},
+          "...and the new handle holds FFXI and nothing else")
+    check(A.ensure_title_slots(ov, member_id=vmid) == 0,
+          "10d. a second login adds nothing while those 8 are free")
+
+    served10 = R._db_chars()
+    per_handle = {}
+    for rec in served10:
+        per_handle[rec[0]] = per_handle.get(rec[0], 0) + 1
+    check(len(served10) == 16 and all(rec[4] for rec in served10)
+          and per_handle == {0: 8, 1: 8},
+          "10e. the wire carries 16 records, all bound, 8 per handle (%s)" % per_handle)
+    check(len(B.pol_content_ids(vmid)) == 9,
+          "10f. the bridge offers the member all 9 FFXI ids (%d)"
+          % len(B.pol_content_ids(vmid)))
+
+    put_characters(member_ffxi())                 # all 9 are characters now
+    got = A.ensure_title_slots(ov, member_id=vmid)
+    hs = handle_rows()
+    check(got == 7 and len(hs) == 3 and hs[2][1] == "Lexborrowdale3"
+          and len(member_ffxi()) == 16,
+          "10g. full again: a third handle tops the member up to 16 (%d minted, %s)"
+          % (got, [h[1] for h in hs]))
+    put_characters(member_ffxi())
+    check(A.ensure_title_slots(ov, member_id=vmid) == 0 and len(handle_rows()) == 3,
+          "10h. at 16 nothing more is made, even with every slot spent")
+    check(primary_links() == before, "...and the primary handle still has not moved")
+
+    # 10i. A map that cannot be read must never read as "every slot is free".
+    spent_hook = TITLE.spent_content_ids
+    TITLE.spent_content_ids = lambda conn=None: None
+    try:
+        check(A.ensure_overflow_slots(ov, vmid, X.CONTENT_CODE, 32) == 0,
+              "10i. no answer about spent ids, no new slots")
+    finally:
+        TITLE.spent_content_ids = spent_hook
+
+    # 10j. Moving one character moves ONE id, never the whole title.
+    h3 = hs[2][0]
+    one = [r["content_id"] for r in A.handle_content_list(ov, h2)][0]
+    check(A.issues_per_character(X.CONTENT_CODE),
+          "FFXI's ids move one at a time")
+    moved = A.move_content_id(ov, h3, X.CONTENT_CODE, one)
+    n1, n2, n3 = (A.handle_link_count(ov, h) for h in (vhid, h2, h3))
+    check(moved and (n1, n2, n3) == (8, 7, 8),
+          "10j. moving one character moves one id (%s, links %s)"
+          % (moved, (n1, n2, n3)))
+    two = [r["content_id"] for r in A.handle_content_list(ov, h2)][0]
+    check(not A.move_content_id(ov, h3, X.CONTENT_CODE, two)
+          and A.handle_link_count(ov, h3) == 8,
+          "10k. a move onto a full handle is refused")
+
+    # 10l. A handle with characters on it is not deleted.
+    name2 = hs[1][1]
+    try:
+        A.delete_handle(ov, vmid, name2)
+        refused = False
+    except ValueError:
+        refused = True
+    check(refused and any(h[1] == name2 for h in handle_rows()),
+          "10l. deleting a handle a character is on is refused, and it stays")
+
+    # 10m. trim-slots leaves FFXI-only handles alone.
+    active_before = len(member_ffxi())
+    X.trim_slots(ov, A, apply=True)
+    check(len(member_ffxi()) == active_before,
+          "10m. trim-slots --apply leaves FFXI-only handles alone (%d -> %d)"
+          % (active_before, len(member_ffxi())))
+
+    # 10n. Four handles already: the client has no fifth slot, so nothing is made.
+    full4 = fresh_db("four-handles")
+    A.create_polid(full4, "FOURH", "pw-account")
+    fmid4 = A.add_member(full4, "FOURH", "fourh", "pw-member")
+    A.set_handle(full4, fmid4, "Quad")
+    for extra in ("QuadB", "QuadC", "QuadD"):
+        A.set_handle(full4, fmid4, extra, primary=False)
+    A.grant_content(full4, fmid4, X.CONTENT_CODE)
+    A.link_member_content_to_primary(full4, fmid4)
+    use_db("four-handles")
+    put_characters([int(x) for x in A.member_content_id_list(full4, fmid4, 1)])
+    check(A.ensure_title_slots(full4, member_id=fmid4) == 0
+          and full4.execute("SELECT COUNT(*) n FROM handle WHERE member_id = %s",
+                            (fmid4,)).fetchone()["n"] == 4,
+          "10n. a member with four handles gets no fifth")
+
+    # 10o. The name fits HANDLE_MAX however long the primary is.
+    longname = A._overflow_handle_name(full4, fmid4, "Fifteencharsxyz")
+    check(longname == "Fifteencharsxy2",
+          "10o. a 15-character primary gives %r" % longname)
+finally:
+    TITLE.member_slots = X.MEMBER_SLOTS
+
+# --------------------------------------------------------------------------- #
+print()
 if FAILED:
     print("RESULT: %d FAILURE(S)" % len(FAILED))
     for f in FAILED:

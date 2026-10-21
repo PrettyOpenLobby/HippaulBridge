@@ -23,6 +23,23 @@ COPY ffxi_gmcalls.py /app/ffxi_gmcalls.py
 COPY ffxi_federation.py /app/ffxi_federation.py
 COPY xitoken.py /app/xitoken.py
 COPY ffxi_fedtool.py /app/ffxi_fedtool.py
+# In-game notices (the login message lines and announcements the LSB map module reads)
+# and their calendar sync. The calendar is OpenLobby's eventcal.py and event-calendar.json,
+# already in /app from the base image.
+COPY ffxi_notices.py /app/ffxi_notices.py
+# The game's own calendar (the map module's calendar table and the Bonanza runs) handed to
+# the core's news posts through polcore.kv.
+COPY ffxi_calendar.py /app/ffxi_calendar.py
+# Mog Bonanza admin (ffxi_fedtool imports it at startup: without it the bridge cannot start)
+COPY ffxi_bonanza.py /app/ffxi_bonanza.py
+# Characters admin (ffxi_fedtool imports it at startup: without it the bridge cannot start)
+COPY ffxi_chars.py /app/ffxi_chars.py
+# Auction house admin (ffxi_fedtool imports it at startup: without it the bridge cannot start)
+COPY ffxi_auction.py /app/ffxi_auction.py
+# Seasonal events admin (ffxi_fedtool imports it at startup: without it the bridge cannot start)
+COPY ffxi_events.py /app/ffxi_events.py
+# Its zone lines and heavy-cutscene catalog (tools/gen_ffxi_testdata.py)
+COPY ffxi_testdata.json /app/ffxi_testdata.json
 # The bridge's tables: the database plumbing and HippaulBridge's migrations
 # (6001-6999), applied by the bridge when it starts.
 COPY ffxidb.py /app/ffxidb.py
@@ -42,4 +59,8 @@ RUN python -c "import accounts, polcore.db, polcore.kv, ffxidb" \
 # map are tables in the core's PostgreSQL (POL_DATABASE_URL). -u so
 # `docker logs` sees output immediately; the bridge's own diagnostics are
 # worthless an hour late.
+# The bridge's ports (the LSB-facing listeners, the map relay and the import
+# endpoint) are all above 1024, so it runs as the unprivileged uid that owns
+# the /data and /logs bind mounts (the core image creates it).
+USER 1000
 ENTRYPOINT ["python", "-u", "ffxi_bridge.py"]

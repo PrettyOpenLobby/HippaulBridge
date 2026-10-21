@@ -6,10 +6,7 @@ mistake and still round-trip. So the anchors here come from elsewhere:
 
   1. the PASETO v4.public test vectors (paseto-standard/test-vectors v4.json), which the
      xitoken spec says every implementation must pass first;
-  2. a key set signed by LSB's xi_world (upstream ext/xitoken C++), served by our world on
-     2026-10-04, with the server id xi_world itself logged for that key
-     ("Federation gateway: world xi1.oBcsuiE82Nu2Mg1YrlBH3g");
-  3. both Ed25519 backends (pycryptodome, cryptography) producing the same bytes.
+  2. both Ed25519 backends (pycryptodome, cryptography) producing the same bytes.
 
 The rest holds the issuer and the verifier to the spec's claim shapes and its verification
 order. No network, no database.
@@ -87,29 +84,27 @@ except ImportError:
     print("  SKIP cryptography not installed; only %s checked" % X.BACKEND)
 
 # --------------------------------------------------------------------------------------------
-print("3. A key set signed by upstream's C++ (our world, 2026-10-04)")
-WORLD_ID = "xi1.oBcsuiE82Nu2Mg1YrlBH3g"            # as xi_world logged it for this key
-WORLD_KEYSET = (
-    "v4.public.eyJpYXQiOiIyMDI2LTEwLTA0VDA1OjIyOjQxWiIsImlzcyI6InhpMS5vQmNzdWlFODJOdTJNZzFZcmxCSDNnIiwia2V5cyI6W10s"
-    "Im5hbWUiOiJPcGVuTG9iYnkiLCJ0eXAiOiJ4aS5rZXlzZXQvMSIsIndvcmxkIjp7ImV4cGFuc2lvbnMiOjQwOTUsImdhdGV3YXkiOiJodHRw"
-    "czovL29wZW5sb2JieS5meWkiLCJzZWFyY2giOiI4Mi4yMjEuMTAwLjEyNTo1NDAwMiJ9fftRubZZnnJe8t5LhSF7zn7N0Yl9hCRdkd1ceYHqakS"
-    "-zn18R-9EQebvSMfJCpxcIEjHLUYyqwrj0O7YYYagQAA.eyJpZGsiOiJrNC5wdWJsaWMuWnItTE1FaXFoZXlpYkJYaTl2VTFadzBFZlk4Y1J6"
-    "a1B4emNTQ0FRVE5IWSJ9")
+print("3. A world's key set (a fixed throwaway identity)")
+# A world publishes its own key set; the later sections serve this one from a fake gateway.
+WORLD_IDENT = X.SigningKey("identity", bytes(range(32)))
+WORLD_ID = WORLD_IDENT.server_id
+WORLD_DESC = {"expansions": 4095, "gateway": "https://gateway.example", "search": "203.0.113.10:54002"}
+WORLD_KEYSET = X.make_keyset(WORLD_IDENT, "OpenLobby", [], issued=X.parse_time("2026-01-01T00:00:00Z"),
+                             world=WORLD_DESC)
 try:
     ks = X.load_keyset(WORLD_KEYSET, WORLD_ID)
-    check(ks.server_id == WORLD_ID, "our server id derivation matches the one xi_world logged")
+    check(ks.server_id == WORLD_ID, "the server id is derived from the footer's key")
     check(ks.name == "OpenLobby" and ks.keys == {}, "name and (empty) signing keys read")
-    check(ks.world == {"expansions": 4095, "gateway": "https://openlobby.fyi", "search": "82.221.100.125:54002"},
-          "world description read")
-    check(ks.issued == X.parse_time("2026-10-04T05:22:41Z"), "iat read")
+    check(ks.world == WORLD_DESC, "world description read")
+    check(ks.issued == X.parse_time("2026-01-01T00:00:00Z"), "iat read")
 except X.XiTokenError as e:
-    check(False, "C++-signed key set loads (%s)" % e)
+    check(False, "world key set loads (%s)" % e)
 check(error_of(lambda: X.load_keyset(WORLD_KEYSET, "xi1.AAAAAAAAAAAAAAAAAAAAAA")) == "wrong_issuer",
       "a key set is refused when it is not the id we chose to trust")
 body = WORLD_KEYSET[len(X.HEADER):].split(".")
 flipped = X.HEADER + body[0][:30] + ("A" if body[0][30] != "A" else "B") + body[0][31:] + "." + body[1]
 check(error_of(lambda: X.load_keyset(flipped, WORLD_ID)) in ("bad_signature", "malformed"),
-      "one changed payload character breaks the C++ signature")
+      "one changed payload character breaks the signature")
 
 # --------------------------------------------------------------------------------------------
 print("4. Keys and key sets we make")

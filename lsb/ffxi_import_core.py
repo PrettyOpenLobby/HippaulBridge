@@ -109,6 +109,23 @@ STORAGE_DEFAULTS = {"inventory": 30, "safe": 50, "locker": 0, "satchel": 0,
 
 STORAGE_MAX = 80        # CItemContainer::AddBuff clamps to 0..80 for a player
 
+# Ceilings on the numbers a dump may claim. The dump is made on the player's
+# machine and the self-serve endpoint takes it straight from them, so every
+# figure that reaches SQL is clamped to retail's own limits first; a value
+# past them is a hand-edited dump, and the import writes the cap.
+GIL_MAX = 999_999_999        # retail's gil cap
+JOB_LEVEL_MAX = 99           # the level ceiling, where the genkai ladder ends
+SKILL_MAX = 500              # displayed skill; the highest retail cap with
+                             # merits is in the 400s, crafts top out at 120
+CRAFT_RANK_MAX = 10          # LSB's craft rank ladder, Amateur 0 .. 10
+NATION_RANK_MAX = 10         # mission rank 1..10
+RANK_POINTS_MAX = 4000       # rank points pin at 4000 on retail
+ITEM_STACK_MAX = 99          # no item stacks past 99
+
+
+def clamp(v, lo, hi):
+    return min(max(int(v), lo), hi)
+
 # LOC_STORAGE (2), the mog storage, is the one container with no char_storage
 # column: LSB derives its size from the furnishings installed in the mog safe
 # (charutils.cpp LoadInventory, the AddBuff(getStorage()) call). We cannot set
@@ -610,9 +627,10 @@ def build_statements(dump, name=None, skill_scale=10):
     mjob = int(dump.get("main_job") or 1)
     mjob = mjob if 1 <= mjob <= 22 else 1
     sjob = int(dump.get("sub_job") or 0)
-    jobs = {int(k): int(v) for k, v in (dump.get("jobs") or {}).items()
+    jobs = {int(k): clamp(v, 1, JOB_LEVEL_MAX)
+            for k, v in (dump.get("jobs") or {}).items()
             if int(k) in JOB_COLS and int(v) > 0}
-    gil = max(int(dump.get("gil") or 0), 0)
+    gil = clamp(dump.get("gil") or 0, 0, GIL_MAX)
 
     core, best, warnings = [], [], []
     # The skeleton LSB's loginHelpers::createCharacter writes, verbatim.
@@ -669,7 +687,7 @@ def build_statements(dump, name=None, skill_scale=10):
                       and re.fullmatch(r"[0-9a-fA-F]+", extra))
             extra_sql = f"x'{extra}'" if ok_hex else "''"
             rows.append(f"(@charid, {loc}, {int(slot)}, {int(item_id)}, "
-                        f"{int(count)}, {extra_sql})")
+                        f"{clamp(count, 1, ITEM_STACK_MAX)}, {extra_sql})")
             placed[(loc, int(slot))] = int(item_id)
         if loc == LOC_STORAGE and c.get("items"):
             warnings.append(
@@ -767,10 +785,12 @@ def build_statements(dump, name=None, skill_scale=10):
     skills = {int(k): int(v) for k, v in (dump.get("skills") or {}).items()}
     craft = {int(k): (v if isinstance(v, dict) else {"skill": v, "rank": 0})
              for k, v in (dump.get("crafts") or {}).items()}
-    merged = {sid: (int(val) * skill_scale, 0) for sid, val in skills.items()}
+    merged = {sid: (clamp(val, 0, SKILL_MAX) * skill_scale, 0)
+              for sid, val in skills.items()}
     for idx, c in craft.items():
         merged[CRAFT_SKILL_BASE + int(idx)] = (
-            int(c.get("skill", 0)) * skill_scale, int(c.get("rank", 0)))
+            clamp(c.get("skill", 0), 0, SKILL_MAX) * skill_scale,
+            clamp(c.get("rank", 0), 0, CRAFT_RANK_MAX))
     collisions = sorted(set(skills) & {CRAFT_SKILL_BASE + int(i) for i in craft})
     if collisions:
         warnings.append(
@@ -793,10 +813,11 @@ def build_statements(dump, name=None, skill_scale=10):
     if ki_dropped:
         warnings.append(f"{ki_dropped} key item id(s) were outside LSB's "
                         f"0..{KEYITEM_MAX - 1} range and were dropped.")
-    rank = int(dump.get("rank") or 0)
+    rank = clamp(dump.get("rank") or 0, 0, NATION_RANK_MAX)
     if rank > 0:
+        rank_points = clamp(dump.get("rank_points") or 0, 0, RANK_POINTS_MAX)
         best.append(f"UPDATE char_profile SET {NATION_RANK_COL[nation]} = {rank}, "
-                    f"rank_points = {int(dump.get('rank_points') or 0)} "
+                    f"rank_points = {rank_points} "
                     f"WHERE charid = @charid")
 
     # The level cap. `genkai` is "the maximum genkai level achieved" and LSB
