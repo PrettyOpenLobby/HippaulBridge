@@ -2,7 +2,8 @@
 """lsb/ffxi_chars.py and the Characters page of lsb/ffxi_fedtool.py.
 
 Offline (always): the checks on what the page sends, the test-character rules, and the tool-port
-contract on the new routes, over an in-memory stand-in for the Store.
+contract on the new routes (the account window's /chars/player.json among them), over an
+in-memory stand-in for the Store.
 
 Against a real database (--db): every change on real LSB tables. Load LSB's sql/ into an empty
 MariaDB first; the run adds two made-up characters (ids 900001 and 900002), checks moving,
@@ -93,6 +94,12 @@ class FakeStore:
 
     def log(self, limit=60):
         return []
+
+    LOGINS = {1: "pol5", 2: "oldname"}
+
+    def of_logins(self, logins, limit=64):
+        return sorted((c for c in self.chars.values() if self.LOGINS.get(c["accid"]) in logins),
+                      key=lambda c: c["charname"])
 
     def lost_contact(self, limit=50):
         return [{"id": 1, "at": 1791780000, "charid": 11, "charname": "Arbor", "console": 1, "zone": 246, "prevzone": 246,
@@ -405,6 +412,37 @@ def offline():
     check(s == 200 and json.loads(d)["ok"], "POST /chars/additem")
     s, d = req("POST", "/chars/gil", {"id": 11, "gil": 5})
     check(s == 200 and json.loads(d)["ok"], "POST /chars/gil")
+    srv.shutdown()
+
+    # one player, for the panel's account window
+    st = FakeStore()
+    st.chars[12]["online"] = 1
+    got = C.Chars(st).player(["pol5"])
+    arbor = (got.get("characters") or [{}])[0]
+    check([c["name"] for c in got.get("characters", [])] == ["Arbor"]
+          and arbor["detail"] == "BLU 67/RDM 33, Port Jeuno" and arbor["online"] is False
+          and {f["label"]: f["value"] for f in arbor["facts"]} == {"main job": "BLU 67", "support job": "RDM 33",
+                                                                  "zone": "Port Jeuno", "nation": "San d'Oria"},
+          "player: a character's job, zone, nation and whether it is logged in")
+    check(C.Chars(st).player(["nobody"]) == {}, "player: an account with no characters is nothing")
+    bridge = types.SimpleNamespace(log=lambda *a: None, FED=None, _acctmap_lock=threading.Lock(),
+                                   _acctmap={"6": {"login": "oldname"}, "alt:5": {"login": "elsewhere"}})
+    check(T.player_logins(bridge, [5, 6]) == ["pol5", "oldname", "pol6"],
+          "player: a member's LSB accounts are the bridge's map and pol<member>, the primary world only")
+    T._CHARS[:] = [C.Chars(st)]
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), T.make_handler(T.Tool(bridge, environ={}), "tok"))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    port = srv.server_address[1]
+    s, d = req("GET", "/chars/player.json?members=5%2C6")
+    doc = json.loads(d)
+    check(s == 200 and [(c["name"], c["online"]) for c in doc["characters"]] == [("Arbor", False), ("Birch", True)],
+          "GET /chars/player.json: every character of the members, the logged-in one online")
+    check(json.loads(req("GET", "/chars/player.json?members=8")[1]) == {}, "GET /chars/player.json: a member with none is {}")
+    check(json.loads(req("GET", "/chars/player.json?members=x")[1]) == {}, "GET /chars/player.json: no member id, nothing")
+    check(req("GET", "/chars/player.json?members=5", token="bad")[0] == 403, "GET /chars/player.json needs the token")
+    text = json.dumps(doc)
+    check(not any(k in text for k in ("accid", "charid", "pol5", "oldname", "client_addr", "session", "pos_x")),
+          "GET /chars/player.json: no account names, ids, addresses or positions")
     srv.shutdown()
 
 

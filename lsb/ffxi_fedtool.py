@@ -22,6 +22,8 @@ A third, /bonanza, manages the Mog Bonanza runs (ffxi_bonanza.py); its routes st
 A fourth, /chars, looks up and fixes characters (ffxi_chars.py): move one, take off its
 equipment, edit its character variables, give it items, copy one onto a test character, and
 undo any of it. Its routes start with /chars and it reads and writes the LSB database directly.
+/chars/player.json answers the panel's account window: the characters of the POL members it is
+given, through the LSB accounts the bridge made for them.
 
 A fifth, /ah, lists and changes the auction house (ffxi_auction.py): prices, taking a listing
 down, test listings. Its routes start with /ah and it reads and writes the LSB database directly.
@@ -492,6 +494,38 @@ def chars_get(path, query):
         return 503, {"error": "The LSB database said: %s" % exc}
 
 
+def player_logins(bridge, members):
+    """The LSB account names of these POL members on the primary world: the one the bridge's
+    account map (ffxi_lsb_account) records, and pol<member id>, the name the bridge gives every
+    account it creates (ffxi_bridge.lsb_account_for). Another world's accounts are not here."""
+    acct = getattr(bridge, "_acctmap", None) or {}
+    lock = getattr(bridge, "_acctmap_lock", None)
+    if lock is not None:
+        with lock:
+            acct = dict(acct)
+    out = []
+    for m in members:
+        for login in ((acct.get(str(m)) or {}).get("login"), ("pol%d" % m)[:16]):
+            if login and login not in out:
+                out.append(login)
+    return out
+
+
+def chars_player(tool, query):
+    """GET /chars/player.json?members=1,2 (POL member ids): the characters those members have,
+    for the panel's account window -> (status, obj); {} when they have none."""
+    raw = ",".join(urllib.parse.parse_qs(query).get("members") or [])
+    members = sorted({int(x) for x in raw.split(",") if x.strip().isdigit()})[:32]
+    if not members:
+        return 200, {}
+    try:
+        return 200, _chars().player(player_logins(tool.bridge, members))
+    except ToolError as exc:
+        return 503, {"error": str(exc)}
+    except Exception as exc:
+        return 503, {"error": "The LSB database said: %s" % exc.__class__.__name__}
+
+
 # -- Auction house (the /ah page, ffxi_auction.py) ------------------------------------------------
 
 _AH = []
@@ -626,6 +660,8 @@ def make_handler(tool, token):
                 return self._json(*bonanza_get(path, urllib.parse.urlsplit(self.path).query))
             if path == "/chars":
                 return self._send(200, C.PAGE, "text/html; charset=utf-8")
+            if path == "/chars/player.json":
+                return self._json(*chars_player(tool, urllib.parse.urlsplit(self.path).query))
             if path in ("/chars.json", "/chars/search.json", "/chars/char.json", "/chars/arrivals.json",
                         "/chars/data.json", "/chars/items.json"):
                 return self._json(*chars_get(path, urllib.parse.urlsplit(self.path).query))

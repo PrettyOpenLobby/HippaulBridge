@@ -70,6 +70,8 @@ COPY_GROUPS = {
     "other": {"label": "Other", "tables": ("char_effects",), "cols": ("settings", "languages", "mentor")},
 }
 
+#: chars.nation -> its name
+NATIONS = ["San d'Oria", "Bastok", "Windurst"]
 #: char_inventory.location -> its char_storage column (LSB CONTAINER_ID order)
 CONTAINERS = {0: "inventory", 1: "safe", 2: "storage", 3: "tempitems", 4: "locker", 5: "satchel", 6: "sack", 7: "case",
               8: "wardrobe", 9: "safe2", 10: "wardrobe2", 11: "wardrobe3", 12: "wardrobe4", 13: "wardrobe5",
@@ -415,6 +417,19 @@ class Store:
                 it["extra_len"] = 0
         return blobs, counts, storage[0] if storage else None, items
 
+    def of_logins(self, logins, limit=64):
+        """The characters on these LSB accounts (accounts.login), with job, zone and whether each
+        is logged in. A deleted character has accid 0 and is not among them."""
+        logins = [str(x) for x in logins if x][:64]
+        if not logins:
+            return []
+        return self._run("SELECT c.charid, c.charname, c.nation, c.pos_zone, z.name AS zone_name, s.mjob, s.mlvl, "
+                         "s.sjob, s.slvl, (SELECT COUNT(*) FROM accounts_sessions x WHERE x.charid = c.charid) AS online "
+                         "FROM chars c JOIN accounts a ON a.id = c.accid LEFT JOIN char_stats s ON s.charid = c.charid "
+                         "LEFT JOIN zone_settings z ON z.zoneid = c.pos_zone WHERE a.login IN (" +
+                         ", ".join(["%s"] * len(logins)) + ") ORDER BY c.charname LIMIT %s",
+                         tuple(logins) + (int(limit),), fetch=True)
+
     def lost_contact(self, limit=50):
         """openlobby_crash_log (written by the bridge, ffxi_bridge.py record_lost_contact); [] before its first row."""
         have = self._run("SELECT COUNT(*) AS n FROM information_schema.tables WHERE table_schema = DATABASE() "
@@ -609,6 +624,28 @@ class Chars:
         return {"char": c, "equipment": self.store.equipment(charid), "variables": variables,
                 "zones": self.store.zones(), "is_test": charid == self._test_id(),
                 "scenario": scenario_status(variables)}
+
+    def player(self, logins):
+        """The account window's answer for the characters on these LSB accounts: {"characters":
+        [{name, detail, online, facts}], "note"}, or {} when there are none."""
+        chars = []
+        for c in self.store.of_logins(logins):
+            def job(j, lvl):
+                j = int(j or 0)
+                return "%s %s" % (JOBS[j] if 0 < j < len(JOBS) else "#%d" % j, lvl or 0)
+            main = job(c.get("mjob"), c.get("mlvl")) if c.get("mjob") else ""
+            sub = job(c.get("sjob"), c.get("slvl")) if c.get("sjob") else ""
+            zone = str(c.get("zone_name") or "").replace("_", " ")
+            nation = NATIONS[c["nation"]] if c.get("nation") in (0, 1, 2) else ""
+            facts = [{"label": "main job", "value": main or "-"}]
+            if sub:
+                facts.append({"label": "support job", "value": sub})
+            facts.append({"label": "zone", "value": zone or "zone %s" % c.get("pos_zone")})
+            if nation:
+                facts.append({"label": "nation", "value": nation})
+            chars.append({"name": c["charname"], "detail": ", ".join(x for x in (main + ("/" + sub if sub else ""), zone) if x),
+                          "online": bool(c.get("online")), "facts": facts})
+        return {"characters": chars, "note": ""} if chars else {}
 
     def summary(self, charid):
         c = self._char(charid)

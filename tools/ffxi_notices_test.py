@@ -399,7 +399,8 @@ check(call("POST", "/notices/nope", {})[0] == 404 and call("GET", "/notices/x")[
 print("8. The panel's side (admingames): the Notices tool and the maintenance warning's call")
 sys.path.insert(0, os.path.join(HERE, os.pardir, os.pardir, "openlobby", "services"))
 import admingames as G                                             # noqa: E402
-check([t["path"] for t in G.GAMES["ffxi"]["tools"]][:2] == ["", "notices"] and G._is_page("notices"),
+import adminmodules as M                                           # noqa: E402
+check([t.path for t in M.load()["ffxi"].tools][:2] == ["", "notices"] and G._is_page("ffxi", "notices"),
       "FFXI lists Federation and Notices; an unreachable Notices page is shown as a page")
 for k in ("POL_ADMIN_GAME_FFXI_URL", "POL_ADMIN_GAME_FFXI_TOKEN"):
     os.environ.pop(k, None)
