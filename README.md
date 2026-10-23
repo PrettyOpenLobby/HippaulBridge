@@ -87,10 +87,14 @@ LSB team's ximeshes image, which populates a volume on first mount:
 
 ```
 docker volume create lsb_navmeshes
-docker run --rm -v lsb_navmeshes:/navmeshes ghcr.io/landsandboat/ximeshes:latest
+docker run --rm -v lsb_navmeshes:/navmeshes ghcr.io/landsandboat/ximeshes:latest sh -c 'echo pathfinding mesh files: $(ls /navmeshes | wc -l)'
 docker volume create lsb_ximeshes
-docker run --rm -v lsb_ximeshes:/ximeshes ghcr.io/landsandboat/ximeshes:latest
+docker run --rm -v lsb_ximeshes:/ximeshes ghcr.io/landsandboat/ximeshes:latest sh -c 'echo zone geometry files: $(ls /ximeshes | wc -l)'
 ```
+
+Each run prints how many files its volume holds (about 300 zone geometry files);
+0 means the volume was not new, and `docker volume rm` it first. Docker copies
+the image's files into a volume only the first time an empty one is mounted.
 
 They are external volumes on purpose: `docker compose down -v` never touches
 them. The ximeshes image is used by tag here because it is consumed once for
