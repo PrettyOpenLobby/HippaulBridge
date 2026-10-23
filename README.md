@@ -83,7 +83,18 @@ each title image on the previous one and lists every plugin in `POL_TITLES`.
 **1. Mesh volumes (one time).** LSB's map server needs both `/navmeshes`
 (pathfinding) and `/ximeshes` (zone geometry), and aborts at start without the
 second one, which LSB's own Docker notes do not mention. Both come from the
-LSB team's ximeshes image, which populates a volume on first mount:
+LSB team's ximeshes image, which populates a volume on first mount.
+
+You normally do nothing here: installing, turning on or updating FFXI from
+OpenLobby's admin panel, and OpenLobby's setup scripts, create and fill both
+volumes by themselves (about 570 MB, downloaded once), and leave them alone
+when they already hold files. From the command line the same is
+
+```
+python ../openlobby/tools/stack.py volumes ffxi
+```
+
+which prints how many files each one holds. By hand, if you would rather:
 
 ```
 docker volume create lsb_navmeshes
